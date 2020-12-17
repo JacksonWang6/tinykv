@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
@@ -38,22 +37,76 @@ func NewServer(storage storage.Storage) *Server {
 // Raw API.
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	reader, err := server.storage.Reader(nil)
+	value, err :=  reader.GetCF(req.Cf, req.Key)
+	// 如果键没有找到,那么按照第二个测试,我们应该返回
+	if value == nil {
+		return &kvrpcpb.RawGetResponse{
+			NotFound: true,
+		}, nil
+	}
+	// 找到了, 那就直接返回值就可以了
+	return &kvrpcpb.RawGetResponse{
+		Value:                value,
+	}, err
 }
 
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	// Modify代表操作,有两种,一种是PUT,一种是Delete
+	return nil, server.storage.Write(nil, []storage.Modify{
+		{
+			Data: storage.Put{
+				Key:   req.Key,
+				Value: req.Value,
+				Cf:    req.Cf,
+			},
+		},
+	})
 }
 
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	return nil, server.storage.Write(nil, []storage.Modify{
+		{
+			Data: storage.Delete{
+				Key:   req.Key,
+				Cf:    req.Cf,
+			},
+		},
+	})
 }
 
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	// 首先拿到reader
+	reader, _ := server.storage.Reader(nil)
+	// 然后拿到迭代器
+	it := reader.IterCF(req.Cf)
+	it.Seek(req.StartKey)
+	var i uint32
+	res := kvrpcpb.RawScanResponse{
+		Kvs: []*kvrpcpb.KvPair{},
+	}
+	// 遍历迭代器
+	for i = 0; i < req.Limit; i++ {
+		item := it.Item()
+		value, err := item.Value()
+		if err != nil {
+			return nil, err
+		}
+		res.Kvs = append(res.Kvs, &kvrpcpb.KvPair{
+			Key:   item.Key(),
+			Value: value,
+		})
+		it.Next()
+		if it.Valid() == false {
+			break
+		}
+	}
+	//! 关闭迭代器
+	it.Close()
+	return &res, nil
 }
 
 // Raft commands (tinykv <-> tinykv)
