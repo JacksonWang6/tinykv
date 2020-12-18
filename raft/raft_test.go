@@ -82,7 +82,7 @@ func TestLeaderElection2AA(t *testing.T) {
 		tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 		sm := tt.network.peers[1].(*Raft)
 		if sm.State != tt.state {
-			t.Errorf("#%d: state = %s, want %s", i, sm.State, tt.state)
+			t.Errorf("#%d: state = %s, want %s, smid: %d", i, sm.State, tt.state, sm.id)
 		}
 		if g := sm.Term; g != tt.expTerm {
 			t.Errorf("#%d: term = %d, want %d", i, g, tt.expTerm)
@@ -627,6 +627,7 @@ func TestRecvMessageType_MsgRequestVote2AA(t *testing.T) {
 
 	for i, tt := range tests {
 		sm := newTestRaft(1, []uint64{1}, 10, 1, NewMemoryStorage())
+		// DPrintf("test1 %v\n", sm.RaftLog)
 		sm.State = tt.state
 		sm.Vote = tt.voteFor
 		sm.RaftLog = newLog(&MemoryStorage{ents: []pb.Entry{{}, {Index: 1, Term: 2}, {Index: 2, Term: 2}}})
@@ -1540,6 +1541,7 @@ func newNetworkWithConfig(configFunc func(*Config), peers ...stateMachine) *netw
 
 	for j, p := range peers {
 		id := peerAddrs[j]
+		DPrintf("peerid: [%d]", id)
 		switch v := p.(type) {
 		case nil:
 			nstorage[id] = NewMemoryStorage()
@@ -1570,7 +1572,9 @@ func (nw *network) send(msgs ...pb.Message) {
 	for len(msgs) > 0 {
 		m := msgs[0]
 		p := nw.peers[m.To]
+		// DPrintf("before")
 		p.Step(m)
+		// DPrintf("after")
 		msgs = append(msgs[1:], nw.filter(p.readMessages())...)
 	}
 }
