@@ -93,6 +93,8 @@ func TestLeaderElection2AA(t *testing.T) {
 // testLeaderCycle verifies that each node in a cluster can campaign
 // and be elected in turn. This ensures that elections work when not
 // starting from a clean slate (as they do in TestLeaderElection)
+// 这个测试点就是3个服务器,第一轮里面1发起选举,第二轮2发起选举,第三轮3发起选举, 每一轮发起选举的应该成为leader,其他的为follower
+// 加了log之后出现的问题就是新官上任之后有一个空日志,但是这个空日志并没有通过append请求复制到其他机器上面
 func TestLeaderCycle2AA(t *testing.T) {
 	var cfg func(*Config)
 	n := newNetworkWithConfig(cfg, nil, nil, nil)
@@ -135,6 +137,11 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	// entry overwrites the losers'. (TestLeaderSyncFollowerLog tests
 	// the case where older log entries are overwritten, so this test
 	// focuses on the case where the newer entries are lost).
+	// 抽象一下就是下面的场景
+	// 1.  1
+	// 2.  1
+	// 3.  2
+	// 此时1, 2, 3都可能获得下一次的选举的胜利, 不管谁胜利都会覆写日志条目
 	n := newNetworkWithConfig(cfg,
 		entsWithConfig(cfg, 1),     // Node 1: Won first election
 		entsWithConfig(cfg, 1),     // Node 2: Got logs from node 1
@@ -290,6 +297,7 @@ func TestLogReplication2AB(t *testing.T) {
 				}
 			}
 			for k, m := range props {
+				// bug here: 数组下标越界
 				if !bytes.Equal(ents[k].Data, m.Entries[0].Data) {
 					t.Errorf("#%d.%d: data = %d, want %d", i, j, ents[k].Data, m.Entries[0].Data)
 				}
@@ -342,6 +350,7 @@ func TestCommitWithoutNewTermEntry2AB(t *testing.T) {
 	}
 }
 
+// 这个测试就是测试候选人之间出现竞争的情况
 func TestDuelingCandidates2AB(t *testing.T) {
 	a := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
 	b := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
@@ -582,6 +591,8 @@ func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 	}
 }
 
+// 在添加了日志的逻辑之后, 这个点又挂掉了, 现在来查一查原因
+// 原来是发生段错误了, 也就是解引用了nil
 func TestRecvMessageType_MsgRequestVote2AA(t *testing.T) {
 	msgType := pb.MessageType_MsgRequestVote
 	msgRespType := pb.MessageType_MsgRequestVoteResponse
@@ -630,6 +641,8 @@ func TestRecvMessageType_MsgRequestVote2AA(t *testing.T) {
 		// DPrintf("test1 %v\n", sm.RaftLog)
 		sm.State = tt.state
 		sm.Vote = tt.voteFor
+		// fmt.Printf("1\n")
+		// 根据二分法定位到了段错误就是下面这一行代码产生的
 		sm.RaftLog = newLog(&MemoryStorage{ents: []pb.Entry{{}, {Index: 1, Term: 2}, {Index: 2, Term: 2}}})
 
 		// raft.Term is greater than or equal to raft.RaftLog.lastTerm. In this

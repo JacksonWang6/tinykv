@@ -470,6 +470,8 @@ func TestLeaderAcknowledgeCommit2AB(t *testing.T) {
 			}
 		}
 
+		// 这里第0, 2, 6个点挂掉了, 调试康康
+		DPrintf("r.RaftLog.committed: %d, li: %d, tt.wack: %v", r.RaftLog.committed, li, tt.wack)
 		if g := r.RaftLog.committed > li; g != tt.wack {
 			t.Errorf("#%d: ack commit = %v, want %v", i, g, tt.wack)
 		}
@@ -499,6 +501,7 @@ func TestLeaderCommitPrecedingEntries2AB(t *testing.T) {
 
 		for _, m := range r.readMessages() {
 			r.Step(acceptAndReply(m))
+			DPrintf("...%d", m.Index+uint64(len(m.Entries)))
 		}
 
 		li := uint64(len(tt))
@@ -828,6 +831,7 @@ func TestVoter2AA(t *testing.T) {
 	}
 	for i, tt := range tests {
 		storage := NewMemoryStorage()
+		// fmt.Printf("debug: %d\n", len(storage.ents))
 		storage.Append(tt.ents)
 		r := newTestRaft(1, []uint64{1, 2}, 10, 1, storage)
 
@@ -901,6 +905,9 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 	// simulate the response of MessageType_MsgAppend
 	msgs := r.readMessages()
 	for _, m := range msgs {
+		// 终于找到bug了, msgs里面最开始几个是心跳包的回应 msgtype: MsgHeartbeat, len(m.entries): 0
+		DPrintf("msgtype: %v, len(m.entries): %d, m.entries[0].data: %v\n",
+			m.MsgType, len(m.Entries), m.Entries[0].GetData())
 		if m.MsgType != pb.MessageType_MsgAppend || len(m.Entries) != 1 || m.Entries[0].Data != nil {
 			panic("not a message to append noop entry")
 		}

@@ -18,6 +18,7 @@ import (
 	"errors"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
+	"sort"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -160,6 +161,7 @@ type Raft struct {
 	// 下方是我自己添加的字段
 	peers []uint64
 	electionRandomTimeOut int
+	reject int
 }
 
 // newRaft return a raft peer with the given config
@@ -173,14 +175,7 @@ func newRaft(c *Config) *Raft {
 		id:               c.ID,
 		Term:             0,
 		Vote:             None,
-		RaftLog:          &RaftLog{
-			storage:         c.Storage,
-			committed:       0,
-			applied:         c.Applied,
-			stabled:         0,
-			entries:         c.Storage.(*MemoryStorage).ents,
-			pendingSnapshot: &pb.Snapshot{},
-		},
+		RaftLog:          newLog(c.Storage),
 		Prs:              make(map[uint64]*Progress),
 		State:            StateFollower,
 		votes:            make(map[uint64]bool),
@@ -200,11 +195,18 @@ func newRaft(c *Config) *Raft {
 		// DPrintf("[%d] 正在构造Raft实例 peer = %d", r.id, peer)
 		r.Prs[peer] = &Progress{
 			Match: 0,
-			Next:  0,
+			// 因为storege里面的源码显示log的下标从1开始
+			Next:  1,
 		}
 	}
+
+	// 根据测试用例, 我们还要从hardState中获取vote和term: TestLeaderElectionOverwriteNewerLogs2AB
+	hardState, _, _ := r.RaftLog.storage.InitialState()
+	r.Vote = hardState.Vote
+	r.Term = hardState.Term
+	r.RaftLog.committed = hardState.Commit
 	// DPrintf("%v\n", r.RaftLog.entries)
-	DPrintf("[%d] 创建Raft实例", r.id)
+	DPrintf("[%d] [Term: %d] 创建Raft实例", r.id, r.Term)
 	return &r
 }
 
@@ -212,27 +214,51 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
+	// log下标从1开始
+	// 本来2aa过了, 结果写2ab写了一半之后测了一下2aa又挂了, 心态崩了, 调试了一下之后发现, 挂掉的原因就是心跳包与日志包的log的index等
+	// 不对, 导致比较日志新旧的时候出现了问题, 还得好好研究一下日志这一块, 有点难顶
+	// update: 现在终于有点懂了, 把log以及storage里面的几个辅助函数实现了之后世界美好了好多,唉,没想到这两个文件提供了这么多有用的函数
+	prevLogIndex := r.Prs[to].Next-1				// 将要发送给对方的log的前一条log的下标以及任期号,用来让对方比较新旧
+	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 	msg := pb.Message{
 		MsgType:              pb.MessageType_MsgAppend,
 		To:                   to,
 		From:                 r.id,
 		Term:                 r.Term,
-		LogTerm:              0,
-		Index:                0,
+		LogTerm:              prevLogTerm, // Note: 现在非常担心这里可能出现下标越界
+		Index:                prevLogIndex,
 		Entries:              []*pb.Entry{},
-		Commit:               0,
+		Commit:               r.RaftLog.committed,	// 让对方知道哪些条目是已经可以提交的了
 		Snapshot:             nil,
 		Reject:               false,
 		XXX_NoUnkeyedLiteral: struct{}{},
 		XXX_unrecognized:     nil,
 		XXX_sizecache:        0,
 	}
+	// 判断自己的日志里面是否有可以添加的
+	if r.Prs[to].Next <= r.RaftLog.LastIndex() {
+		// DPrintf("正在添加日志条目...")
+		// BUG here: index并不是这一个日志在entries中的下标, 太坑了, 所以导致这里appendEntry了个寂寞
+		//for _, entry := range r.RaftLog.entries[r.Prs[to].Next:] {
+		//	msg.Entries = append(msg.Entries, &entry)
+		//}
+		DPrintf("next: %d", r.Prs[to].Next)
+		// DPrintf("r.RaftLog.entries[r.Prs[to].Next-stabled]: %v", r.RaftLog.entries[r.Prs[to].Next-stabled])
+		// update: 做出了修改, 之前对log entry的结构理解有误
+		first := r.RaftLog.entries[0].Index
+		// fix bug: 这个bug藏得太深了, 注意这个entries数组放的是地址,并且都是entry的地址,导致其实整个数组的值都是一样的,因为地址都一样
+		//for _, entry := range r.RaftLog.entries[r.Prs[to].Next-first:] {
+		//	DPrintf("eee %v", entry)
+		//	msg.Entries = append(msg.Entries, &entry)
+		//}
+		for i := r.Prs[to].Next-first; i < r.RaftLog.LastIndex(); i++ {
+			msg.Entries = append(msg.Entries, &r.RaftLog.entries[i])
+		}
+		DPrintf("[%d] 发送 entries 给 [%d]: %v", r.id, to, msg.Entries)
+	}
 	r.msgs = append(r.msgs, msg)
-	// 重置计时器
-	r.heartbeatElapsed = 0
-	r.electionElapsed = 0
-	DPrintf("[%d] 向 [%d] 发送AppendEntry包", r.id, to)
-	return false
+	DPrintf("[%d] [Term: %d] 向 [%d] 发送AppendEntry包, entries: %v", r.id, r.Term, to, msg.Entries)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -258,7 +284,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		XXX_sizecache:        0,
 	}
 	r.msgs = append(r.msgs, msg)
-	DPrintf("[%d] 向 [%d] 发送心跳包", r.id, to)
+	DPrintf("[%d] [Term: %d] 向 [%d] 发送心跳包", r.id, r.Term, to)
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -276,7 +302,7 @@ func (r *Raft) tick() {
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			// 广播心跳包
 			// r.broadcastHeartBeat()
-			DPrintf("[%d] 心跳超时, 准备广播心跳包", r.id)
+			DPrintf("[%d] [Term: %d] 心跳超时, 准备广播心跳包", r.id, r.Term)
 			r.Step(pb.Message{
 				MsgType: pb.MessageType_MsgBeat,
 				From:    r.id,
@@ -297,7 +323,7 @@ func (r *Raft) tick() {
 			//          'MessageType_MsgHup' to its Step method and start a new election.
 			// 			也就是说不能直接调用广播,必须得构造一个信息传到step里面才行,qwq
 			// fmt.Printf("超时\n")
-			DPrintf("[%d] 选举超时, 准备广播选举包", r.id)
+			DPrintf("[%d] [Term: %d] 选举超时, 准备广播选举包", r.id, r.Term)
 			r.Step(pb.Message{
 				MsgType: pb.MessageType_MsgHup,
 				From:    r.id,
@@ -314,7 +340,7 @@ func (r *Raft) tick() {
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	// 2aa: 这里采用状态机的思想来理解, 身份对应到状态机就是状态,身份的切换就是状态的改变
-	DPrintf("[%d] [Term %d] 成为Follower", r.id, r.Term)
+	DPrintf("[%d] [Term %d] 成为Follower", r.id, term)
 	r.votes = make(map[uint64]bool, 0)
 	r.State = StateFollower
 	r.electionElapsed = 0
@@ -322,6 +348,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Term = term
 	r.Lead = lead
 	r.Vote = None
+	r.reject = 0
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -332,6 +359,8 @@ func (r *Raft) becomeCandidate() {
 	DPrintf("[%d] [Term+1 = %d] 成为Candidate", r.id, r.Term+1)
 	r.votes = make(map[uint64]bool, 0)
 	r.State = StateCandidate
+	// 候选人没有leader
+	r.Lead = None
 	//  ⾃增当前的任期号（currentTerm）
 	r.Term += 1
 	//  给⾃⼰投票
@@ -339,6 +368,7 @@ func (r *Raft) becomeCandidate() {
 	r.Vote = r.id
 	//  重置选举超时计时器
 	r.electionElapsed = 0
+	r.reject = 0
 	//  发送请求投票的 RPC 给其他所有服务器
 	// r.launchVote()
 }
@@ -347,13 +377,35 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
-	DPrintf("[%d] [Term = %d] 成为Leader", r.id, r.Term)
+	DPrintf("[%d] [Term: %d] 成为Leader", r.id, r.Term)
 	r.votes = make(map[uint64]bool, 0)
 	r.State = StateLeader
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	// 成为领导人之后立即发送空的心跳包给所有的peers
-	r.broadcastHeartBeat()
+	// fix bug: 如果这里立即广播心跳包, 会导致这个测试点挂掉TestLeaderStartReplication2AB
+	// r.broadcastHeartBeat()
+	// 每当成为Leader之后都会更新next和index
+	prevLogIndex := r.RaftLog.LastIndex()
+	for _, peer := range r.peers {
+		r.Prs[peer].Next = prevLogIndex+1
+		r.Prs[peer].Match = 0	// 已经匹配的日志的index,初始化时不知道匹配到哪里, 赋值为0
+	}
+	// The tests assume that the new elected leader should append a noop entry on its term
+	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+		EntryType:            pb.EntryType_EntryNormal,
+		Term:                 r.Term,
+		Index:                prevLogIndex+1,
+		Data: 				  nil,
+	})
+
+	// 按照测试用例 TestProgressLeader2AB, 我们需要在这里更新leader 的match与next
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+
+	// 立即发送append包, 不然会导致添加这条新的日志之后,2aa的一些测试点挂掉
+	// 这里广播包的时候没有考虑只有一台机器的情况, TestLeaderAcknowledgeCommit2AB这个点挂掉了
+	r.broadcastAppendEntries()
 }
 
 // 候选人发起选举
@@ -361,7 +413,9 @@ func (r *Raft) launchVote () {
 	// var peer uint64
 	if len(r.peers) == 1 {
 		r.becomeLeader()
+		return
 	}
+	r.reject = 0
 	for _, peer := range r.peers {
 		// fix bug: 不能跳过自己, 有一个毒瘤测试数据,就是单节点的, 如果跳过自己就收不到回信, 那么就无法执行对应的response逻辑了
 		// fix bug: 后面的测试说明还是得跳过自己
@@ -370,22 +424,20 @@ func (r *Raft) launchVote () {
 			// DPrintf("跳过自己")
 			continue
 		}
+		// fix bug: 这里的lastIndex不应该调用storage里面实现的那个方法, 因为那个只能查出持久化了的最后一个条目的index
+		// 			而我在raftlog里面实现的却可以查出所有的条目,包含未提交的里面的最后一个条目的index
+		prevLogIndex := r.RaftLog.LastIndex()
+		prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 		msg := pb.Message{
 			MsgType:              pb.MessageType_MsgRequestVote,
 			To:                   peer,
 			From:                 r.id,
 			Term:                 r.Term,
-			LogTerm:              0,
-			Index:                0,
-			Entries:              nil,
-			Commit:               0,
-			Snapshot:             nil,
-			Reject:               false,
-			XXX_NoUnkeyedLiteral: struct{}{},
-			XXX_unrecognized:     nil,
-			XXX_sizecache:        0,
+			LogTerm:              prevLogTerm,
+			Index:                prevLogIndex,
 		}
-		DPrintf("[%d] 向 [%d] 发送了一条 选举请求", r.id, peer)
+		DPrintf("[%d] [Term: %d] 向 [%d] 发送了一条 选举请求, prevLogTerm: %d prevLogIndex: %d",
+			r.id, r.Term, peer, prevLogTerm, prevLogIndex)
 		r.msgs = append(r.msgs, msg)
 	}
 }
@@ -393,7 +445,7 @@ func (r *Raft) launchVote () {
 // 广播心跳包
 func (r *Raft) broadcastHeartBeat() {
 	// 遍历map获得key value, key就是我们想要的东西
-	DPrintf("[%d] 正在广播 心跳包", r.id)
+	DPrintf("[%d] [Term: %d] 正在广播 心跳包", r.id, r.Term)
 	for _, peer := range r.peers {
 		// 跳过自己
 		if peer == r.id {
@@ -408,7 +460,7 @@ func (r *Raft) broadcastHeartBeat() {
 
 // 处理选举请求
 func (r *Raft) handlerVote(m pb.Message)  {
-	DPrintf("[%d] 正在处理来自 [%d] 的选举请求", r.id, m.From)
+	DPrintf("[%d] [Term: %d] 正在处理来自 [%d] [Term: %d] 的选举请求", r.id, r.Term, m.From, m.Term)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVoteResponse,
 		To:      m.From,
@@ -426,42 +478,61 @@ func (r *Raft) handlerVote(m pb.Message)  {
 	// fix bug: panic: runtime error: invalid memory address or nil pointer dereference
 	// 基本可以确定这个bug的原因就是r.RaftLog为nil
 	// 查看测试代码,我终于知道bug的原因了, 因为创建log的逻辑需要填写在log.go里面的newlog函数里面
-	logs := r.RaftLog.entries
 	// DPrintf("run here2\n")
 
-	length := uint64(len(r.RaftLog.entries))
+	// length := uint64(len(r.RaftLog.entries))
 
-
-	// fmt.Printf("%v\n", logs)
-	DPrintf("LastLog: [Trem: %d] [index: %d], [%d].LastLog: [Term: %d] [index: %d]", r.id, length-1,
-		m.From, m.LogTerm, m.Index)
-	// 比较日志的新旧
-	if length != 0 {
-		if logs[length-1].Term > m.LogTerm || ((logs[length-1].Term == m.LogTerm) && m.Index < length-1) {
-			// 拒绝
-			r.msgs = append(r.msgs, msg)
-			DPrintf("[%d] 拒绝了 [%d] 的选举请求, 因为日志太旧了", r.id, m.From)
-			return
-		}
-	}
+	// fix bug: 这里需要先判断任期号, 然后再判断日志新旧等决定是否拒绝, 不然这个测试点会挂掉 TestDuelingCandidates2AB
+	//   就是一个掉线很久一直自旋选举的机器, 它的任期号很高, 但是日志很旧, 后来重连了, 它向leader请求投票时, leader会变成follower
+	//   但是leader会拒绝投票, 因为它的日志太旧了, 之后再次选举时, 这个掉线很久的机器不会当选, leader只会在之前的集群当中产生
 	if m.Term > r.Term {
-		r.becomeFollower(m.Term, m.From)
+		r.becomeFollower(m.Term, None)
 	}
+
+	// it votes for the
+	//	sender only when sender's last term is greater than MessageType_MsgRequestVote's term or
+	//	sender's last term is equal to MessageType_MsgRequestVote's term but sender's last committed
+	//	index is greater than or equal to follower's.
+	//! TODO: BUG here
+	// 修正了这里的判断条件, 添加日志之后,当且仅当候选人任期号比自己大, 或者候选人任期号和自己一样大但是候选人的日志至少
+	// 和自己一样新, 一样新指的是最后一条日志的Index至少相同
+	// modify: 这里获取最后一个条目的index采用了之前在raftlog里面实现的方法,不用担心stabled里面的条目为空的情况了
+	//  		同时term的获取方法也改为了采用之前封装好的方法来进行获取
+	prevLogIndex := r.RaftLog.LastIndex()
+	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+	// 比较日志的新旧
+	DPrintf("[%d] LastLog: [Trem: %d] [index: %d] logs:%v, [%d].LastLog: [Term: %d] [index: %d]",
+		r.id, prevLogTerm, prevLogIndex, r.RaftLog.entries, m.From, m.LogTerm, m.Index)
+	if  prevLogTerm> m.LogTerm ||
+		((prevLogTerm == m.LogTerm) && m.Index < prevLogIndex) {
+		// 拒绝
+		DPrintf("m.index %d index %d", m.Index, prevLogIndex)
+		msg.Index = prevLogIndex
+		msg.LogTerm = prevLogTerm
+		r.msgs = append(r.msgs, msg)
+		DPrintf("[%d] 拒绝了 [%d] 的选举请求, 因为日志太旧了", r.id, m.From)
+		return
+	}
+
 	if r.Vote == None || r.Vote == m.From {
 		r.Vote = m.From
 		msg.Reject = false
 		DPrintf("[%d] 同意了 [%d] 的选举请求", r.id, m.From)
+	} else {
+		DPrintf("[%d] 拒绝了 [%d] 的选举请求, 因为已经给别人投票了", r.id, m.From)
 	}
 	r.msgs = append(r.msgs, msg)
 }
 
 // 处理选举请求的回信
 func (r *Raft) handleVoteResponse(m pb.Message) {
+	DPrintf("[%d] [Term: %d] 收到了 [%d] [Term: %d] 的投票回信", r.id, r.Term, m.From, m.Term)
+	DPrintf("lastIndex: %d m.index: %d", r.RaftLog.LastIndex(), m.Index)
+	length := len(r.peers)
 	if m.Reject == false {
 		// 这个人向我们投票了,那么votes里面这个人置为true
 		r.votes[m.From] = true
 		// 然后计算总人数是否过半
-		length := len(r.peers)
 		sum := 0
 		for _, peer := range r.peers {
 			if r.votes[peer] {
@@ -472,6 +543,21 @@ func (r *Raft) handleVoteResponse(m pb.Message) {
 			// 成为leader
 			r.becomeLeader()
 		}
+	} else  {
+		if m.Term > r.Term{ /*|| (m.Term == r.Term && (m.LogTerm > r.RaftLog.LastTerm() ||
+			(m.LogTerm == r.RaftLog.LastTerm() &&  m.Index > r.RaftLog.LastIndex())))*/
+			// TestLeaderElectionOverwriteNewerLogs2AB这个测试用例挂了, 仔细分析测试用例之后发现是因为在投票被拒绝之后
+			// 	我没有加上是否变为follower的判断逻辑
+			// update: 上面的说法错了, 论文遗漏了一点, 就是反对消息超过半数会直接变成follower
+			r.becomeFollower(m.Term, None)
+		}
+		// 暴力出奇迹, 直接加一个字段计算这个值, 我不讲武德的
+		r.reject++
+		if r.reject > length/2 {
+			// fix bug: 这里被拒绝太多时, 成为folower的term不是由m.term决定的, 因为可能自己任期号比较大, 是因为日志
+			// 太旧被拒绝的
+			r.becomeFollower(r.Term, None)
+		}
 	}
 }
 
@@ -479,15 +565,115 @@ func (r *Raft) handleVoteResponse(m pb.Message) {
 func (r *Raft) handleHeartBeatResponse(m pb.Message) {
 	if m.Reject {
 		r.becomeFollower(m.Term, None)
-	} else {
-		r.electionElapsed = 0
-		r.heartbeatElapsed = 0
-		r.votes = make(map[uint64]bool, 0)
 	}
+}
+
+// 广播AppendEntry包
+//!doc then calls 'bcastAppend' method to send those entries to its peers
+func (r *Raft) broadcastAppendEntries () {
+	// fix bug: 单台主机的情况不考虑自己会挂掉, 但是不能直接跳过,因为测试里面过滤掉了自己对自己发的请求
+	// 所以做了如下的特判
+	if len(r.peers) == 1{
+		r.RaftLog.committed = r.RaftLog.LastIndex()
+	}
+	// 重置计时器
+	r.heartbeatElapsed = 0
+	r.electionElapsed = 0
+	for _, peer := range r.peers {
+		if peer == r.id {
+			continue
+		}
+		r.sendAppend(peer)
+	}
+}
+
+// 处理AppendEntry的响应包
+func (r *Raft) handleAppendEntriesResponse (m pb.Message) {
+	if m.Reject {
+		DPrintf("[%d] AppendEntried 被 [%d] 拒绝", r.id, m.From)
+		if m.Term > r.Term {
+			r.becomeFollower(m.Term, None)
+			return
+		}
+		// 否则说明是日志被拒绝
+		// 失败是因为prevLogIndex 位置处的日志条目的任期号和 prevLogTerm 不匹配
+		// 按照论文里面说的, 如果因为日志不一致而失败,减少 nextIndex 重试
+		r.Prs[m.From].Next--
+		// 然后重发, 按照测试TestLeaderSyncFollowerLog2AB的逻辑应该是需要立即重发
+		r.sendAppend(m.From)
+	} else {
+		DPrintf("[%d] AppendEntried 被 [%d] 接收, match: %d", r.id, m.From, m.Index)
+		// 否则说明日志被成功接收了, 更新match与next数组
+		r.Prs[m.From].Match = m.Index
+		// DPrintf("%d, %d", m.Index, r.Prs[r.id].Match)
+		r.Prs[m.From].Next = r.Prs[m.From].Match + 1
+		// fix bug: 在计算commit超过半数的机器时, 忘记更新leader自己的match了, 导致出现错误
+		r.Prs[r.id].Match = r.RaftLog.LastIndex()
+		// 如果存在一个满足 N > commitIndex 的 N,并且大多数的 matchIndex[i] ≥ N 成立,并且 log[N].term == currentTerm
+		// 成立,那么令 commitIndex 等于这个 N (5.3 和 5.4 节)
+		sortArr := make([]int, 0)
+		for _, peer := range r.peers {
+			DPrintf("sort addr: %d", r.Prs[peer].Match)
+			sortArr = append(sortArr, int(r.Prs[peer].Match))
+		}
+		sort.Ints(sortArr)
+		var newCommitIndex int
+		// fix bug: 测试不讲武德, 居然有一个测试点的服务器台数是偶数 TestLeaderOnlyCommitsLogFromCurrentTerm2AB
+		if len(sortArr) % 2 == 0 {
+			newCommitIndex = sortArr[len(sortArr)/2-1]
+		} else {
+			newCommitIndex = sortArr[len(sortArr)/2]
+		}
+
+
+		//if uint64(newCommitIndex) > r.RaftLog.committed {
+		//	r.RaftLog.committed = uint64(newCommitIndex)
+		//}
+		term, _ := r.RaftLog.Term(uint64(newCommitIndex))
+		// DPrintf("term: %d, r.term %d", term, r.Term)
+		// 新的提交更大并且是当前任期的提交,那么可以安全的应用
+		// find bug: 我终于知道为什么commit够了但是没有提交了, 这里最后一条日志的term计算出现了错误
+		if uint64(newCommitIndex) > r.RaftLog.committed && term == r.Term {
+			// fix bug: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+			newCommitIndex = int(min(uint64(newCommitIndex), r.RaftLog.LastIndex()))
+
+			DPrintf("[%d] 新的提交, newcommitIndex=%d", r.id, newCommitIndex)
+			r.RaftLog.committed = uint64(newCommitIndex)
+			// 更新日志提交记录
+			// 从上次apply之后的地方开始提交,一直提交到commit的地方
+			for i := r.RaftLog.applied+1; i <= uint64(newCommitIndex); i++ {
+				// in here you also need to interact with the upper application by the Storage interface
+				// defined in raft/storage.go to get the persisted data like log entries and snapshot.
+				// TODO: 把可以安全应用的数据apply
+			}
+			// 更新已经应用的日志的下标
+			// 按照测试,貌似现在不能更新applied
+			// r.RaftLog.applied = uint64(newCommitIndex)
+			// DPrintf("[%d] 新的apply=%d", r.id, r.RaftLog.applied)
+
+			// TestLeaderSyncFollowerLog2AB 这个测试用例说明当commit被更新之后我们还需要发消息给peers,同步这个消息
+			r.broadcastAppendEntries()
+		}
+	}
+}
+
+// the leader first calls the 'appendEntry' method to append entries to its log
+func (r *Raft) appendEntry(m pb.Message) {
+	for _, entry := range m.Entries {
+		entry.Index = r.RaftLog.LastIndex()+1
+		entry.Term = r.Term
+		DPrintf("***appendEntry***\n[%d] [Term: %d] 正在添加新的entry, Index: %d, Term: %d, entry: %v",
+			r.id, r.Term, entry.Index, entry.Term, *entry)
+		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	}
+	// 每次添加新的entry之后都需要更新自己
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
+// 在2ab卡住了,于是静下心来看了一下文档,发现doc.go写的真是太好了,我好多地方实现的都不够优雅
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	// 2aa: 框架代码这里的状态机的思想的应用简直太经典了
@@ -528,9 +714,12 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHeartbeatResponse:
 			r.handleHeartBeatResponse(m)
 		case pb.MessageType_MsgPropose:
-
+			r.appendEntry(m)
+			r.broadcastAppendEntries()
 		case pb.MessageType_MsgAppend:
 			r.handleAppendEntries(m)
+		case pb.MessageType_MsgAppendResponse:
+			r.handleAppendEntriesResponse(m)
 		case pb.MessageType_MsgHeartbeat:
 			r.handleHeartbeat(m)
 		case pb.MessageType_MsgRequestVote:
@@ -543,14 +732,21 @@ func (r *Raft) Step(m pb.Message) error {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	DPrintf("[%d] 正在处理来自 [%d] 的 AppendEntry 包", r.id, m.From)
+	DPrintf("[%d] [Term: %d] 正在处理来自 [%d] [Term: %d] 的 AppendEntry 包", r.id, r.Term, m.From, m.Term)
+	for _, entry := range m.Entries {
+		DPrintf("--- 其中的entries: %v", *entry)
+	}
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
 		To:      m.From,
 		From:    r.id,
 		Term:    r.Term,
 		Reject: true,
+		Index: m.Index + uint64(len(m.Entries)),
 	}
+	//  When 'MessageType_MsgAppend' is passed to candidate's Step method, candidate reverts
+	//	back to follower, because it indicates that there is a valid leader sending
+	//	'MessageType_MsgAppend' messages.
 	if m.Term < r.Term {
 		r.msgs = append(r.msgs, msg)
 		DPrintf("[%d] 拒绝了 [%d] 的 AppendEntry 包, 因为Term太小了", r.id, m.From)
@@ -560,6 +756,80 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// 否则收到了心跳包,老老实实的当小弟
 	r.becomeFollower(m.Term, m.From)
 	DPrintf("[%d] 接收了来自 [%d] 的 AppendEntry 包, 并且回了信", r.id, m.From)
+
+	// 还得判断任期号是否匹配
+	prevLogIndex := r.RaftLog.LastIndex()
+	// Note here: may be exist bug, i'm not sure
+	// modify: 发现这里其实不需要考虑next一直减减到负数的情况,因为它们的0肯定是相等的, 所以去掉了之前的一个if判断条件
+	if prevLogIndex < m.Index {
+		DPrintf("[%d] 日志没有那么长,匹配不了", r.id)
+		// 没有与之相匹配的日志条目, 返回, 让leader减小next
+		r.msgs = append(r.msgs, msg)
+		return
+	}
+	// fix bug: 这里比较的时候比的是m.Index这个下标的任期号, 我已开始是与最后一个任期号作比较的
+	prevLogTerm, _ := r.RaftLog.Term(m.Index)
+	if prevLogTerm != m.LogTerm {
+		// 对应处的日志的任期号不匹配,那么leader也得减小next, 这样是为了之后可以把不匹配的部分覆盖删除掉, 日志以leader为准
+		r.msgs = append(r.msgs, msg)
+		return
+	}
+
+
+	// 如果已经存在的日志条目和新的产生冲突(索引值相同但是任期号不同),删除这一条和之后所有的 (5.3 节)
+	// 我的个人理解就是如果rf.log下标为prevLogIndex+1的地方如果存在元素并且term与传过来的entries中的term不同,那么这个以及后面的全部不要
+	// fix bug: 这里应该需要一个个的比较,考虑以下情况:
+	//         ↓ (prevIndex)
+	// logs: 1 1 1 2 2 2 2
+	// args:     1 1 2 2 2 2
+	// 			   ↑ (term不相等, 之后的都切掉)
+	len_ := r.RaftLog.LastIndex() - m.Index
+	overlap := 0
+	// tt, _ := r.RaftLog.Term(m.Index)
+	// 所以如果prevlogIndex 与 prevLogTerm匹配上了之后, 但是entries为空, 那么follower里面匹配的后面的日志是否应该删除呢?
+	// 学长答疑: 不应该删, 只有产生冲突才应该删除
+	//if len(m.Entries) == 0 && tt == m.LogTerm {
+	//	DPrintf("[%d] 收到 [%d] 的 AppendEntries, 为空,且匹配, %d", r.id, m.From, m.Index)
+	//	if m.Commit > r.RaftLog.committed {
+	//		r.RaftLog.committed = m.Index
+	//	}
+	//}
+	for i := uint64(0); i < len_ && i < uint64(len(m.Entries)); i++ {
+		term, _ := r.RaftLog.Term(m.Index+i+1)
+		// fix bug: 这里下标越界了好多次, 目前还不能肯定这里的逻辑是不是对的
+		if term != m.Entries[i].Term && m.Index+i+1 > r.RaftLog.committed {
+			// fix bug: 这里截断时的下标操作一开始搞错了
+			first := r.RaftLog.entries[0].Index
+			r.RaftLog.entries = r.RaftLog.entries[:m.Index+i+1-first]
+			DPrintf("[%d] 收到 [%d] 的 AppendEntries 之后删除了不匹配的日志条目,剩余的为 %v", r.id, m.From, r.RaftLog.entries)
+			// fix bug: 截断之后,stabled可能还需要进行改变, 因为storage里面的数据可能出现被截断的情况,这个在测试用例里面出现了
+			//				TestFollowerCheckMessageType_MsgAppend2AB
+			if r.RaftLog.stabled > m.Index+i {
+				DPrintf("[%d] 更新了 stabled: before %d after %d", r.id, r.RaftLog.stabled, m.Index+i)
+				r.RaftLog.stabled = m.Index+i
+			}
+			break
+		}
+		overlap++
+	}
+
+	// 添加日志
+	for _, entry := range m.Entries[overlap:] {
+		DPrintf("[%d] 在log当中添加了条目 %v ", r.id, *entry)
+		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	}
+
+	// 然后判断是否需要commit
+	if m.Commit > r.RaftLog.committed {
+		// 需要commit了
+		// fix bug: 之前更新commit的操作完全错误 TestHandleMessageType_MsgAppend2AB ensure3
+		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
+		for i := r.RaftLog.applied+1; i <= r.RaftLog.committed; i++ {
+			// TODO: apply
+			DPrintf("[%d] apply", r.id)
+		}
+	}
+
 	// 回信
 	msg.Reject = false
 	r.msgs = append(r.msgs, msg)
@@ -568,7 +838,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	DPrintf("[%d] 正在处理来自 [%d] 的心跳包", r.id, m.From)
+	DPrintf("[%d] [Term: %d] 正在处理来自 [%d] [Term: %d] 的心跳包", r.id, r.Term, m.From, m.Term)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		To:      m.From,

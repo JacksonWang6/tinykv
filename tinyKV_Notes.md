@@ -119,3 +119,36 @@ nopStepper就是什么也不干
 今天肝了一个上午,终于把2aa的所有测试点通过了
 
 ![image-20201218111049199](images/image-20201218111049199.png)
+
+一共写了400行代码, 害
+
+![image-20201218111248464](images/image-20201218111248464.png)
+
+
+
+20/12/19 还在日志这里挣扎
+
+- 对于AppendEntry, 需要考虑到只有一台主机的情况,并且不能通过向自己发消息的方式处理, 因为测试会过滤掉
+
+- TestLeaderCommitPrecedingEntries2AB 让我发现我对stabled的误解好大, 好像根本不是我想象的那样, 又对log.go文件进行了修改,通过了测试
+- TestFollowerCheckMessageType_MsgAppend2AB又挂了, 原因是我在匹配日志的时候比较任期号时用的是最后一条任期号,这是不对的,应该用相匹配的index的任期号
+- TestFollowerAppendEntries2AB这个测试又挂了, 后来我观察了一下我之前对logEntry的理解, 发现很多东西完全理解错了, 所以决定从头再来, 之前的初始化的字段全部改掉, storage里面存的是还没有被应用到上层的, 所以appli就是storage的first-1, 而stabled是被持久化到storage的最后一个log 的index, 所以stabled=last, 
+- 当发现日志不匹配之后应该立即重传, 然后还得删除不匹配的日志, 并且把leader传过来的附加到后面, 正确完成这些之后就可以通过这个测试了TestLeaderSyncFollowerLog2AB
+- TestFollowerAppendEntries2AB这个点又挂了, 还是因为截断操作那里出现了问题, 又做了修改, 调试好辛苦哇
+- TestLeaderOnlyCommitsLogFromCurrentTerm2AB这测试点是测试 : 一条日志课提交, 当且仅当它是当前任期并且已经被复制到了大多数机器上面
+
+- 测试不讲武德, 居然有一个测试点的服务器台数是偶数 TestLeaderOnlyCommitsLogFromCurrentTerm2AB
+- 按照测试用例 TestProgressLeader2AB, 我们需要在每次添加entry之后更新leader 的match与next
+
+- 处理选举请求时需要先判断任期号, 然后再判断日志新旧等决定是否拒绝, 不然这个测试点会挂掉 TestDuelingCandidates2AB就是一个掉线很久一直自旋选举的机器, 它的任期号很高, 但是日志很旧, 后来重连了, 它向leader请求投票时, leader会变成follower 但是leader会拒绝投票, 因为它的日志太旧了, 之后再次选举时, 这个掉线很久的机器不会当选, leader只会在之前的集群当中产生
+- If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+
+- 又发现了一个bug, 就是如果appendentry的时候日志项为空, 但是前面的又匹配了,那么这个时候后面的也需要删除..., 好吧, 删除之后又出现问题了
+
+  所以如果prevlogIndex 与 prevLogTerm匹配上了之后, 但是entries为空, 那么follower里面匹配的后面的日志是否应该删除呢?
+
+完结撒花!!!
+
+![image-20201220163937847](images/image-20201220163937847.png)
+
+全部PASS留恋

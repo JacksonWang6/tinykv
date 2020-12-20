@@ -88,6 +88,7 @@ type MemoryStorage struct {
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
 		// When starting from scratch populate the list with a dummy entry at term zero.
+		// 非常nice, 这里表面log的下标其实是从1开始的
 		ents:     make([]pb.Entry, 1),
 		snapshot: pb.Snapshot{Metadata: &pb.SnapshotMetadata{ConfState: &pb.ConfState{}}},
 	}
@@ -111,6 +112,7 @@ func (ms *MemoryStorage) Entries(lo, hi uint64) ([]pb.Entry, error) {
 	ms.Lock()
 	defer ms.Unlock()
 	offset := ms.ents[0].Index
+	DPrintf("offset: %d", offset)
 	if lo <= offset {
 		return nil, ErrCompacted
 	}
@@ -269,5 +271,6 @@ func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 		log.Panicf("missing log entry [last: %d, append at: %d]",
 			ms.lastIndex(), entries[0].Index)
 	}
+	// DPrintf("debug: entries: %v", ms.ents)
 	return nil
 }
