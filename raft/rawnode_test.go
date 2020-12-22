@@ -170,7 +170,9 @@ func TestRawNodeStart2AC(t *testing.T) {
 
 	rawNode.Propose([]byte("foo"))
 	rd = rawNode.Ready()
+	// 懂了, 是因为这里需要我们更新stabled以及applied
 	if el := len(rd.Entries); el != len(rd.CommittedEntries) || el != 1 {
+		// fmt.Printf("%v\n%v\n", rd.Entries, rd.CommittedEntries)
 		t.Errorf("got len(Entries): %+v, len(CommittedEntries): %+v, want %+v", el, len(rd.CommittedEntries), 1)
 	}
 	if !reflect.DeepEqual(rd.Entries[0].Data, rd.CommittedEntries[0].Data) || !reflect.DeepEqual(rd.Entries[0].Data, []byte("foo")) {
@@ -205,6 +207,7 @@ func TestRawNodeRestart2AC(t *testing.T) {
 		t.Fatal(err)
 	}
 	rd := rawNode.Ready()
+	// DPrintf("*** %v", rd.Entries)
 	if !reflect.DeepEqual(rd, want) {
 		t.Errorf("g = %+v,\n             w   %+v", rd, want)
 	}

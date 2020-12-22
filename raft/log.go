@@ -121,7 +121,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 		return []pb.Entry{}
 	}
 	first, _ := l.storage.FirstIndex()
-	DPrintf("debug: stabled %d first %d entry %v", l.stabled, first, l.entries)
+	// DPrintf("debug: stabled %d first %d entry %v", l.stabled, first, l.entries)
 	return l.entries[l.stabled+1-first:]
 }
 
@@ -129,14 +129,14 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	// fix bug, 如果没判断这个空的情况, 会报panic
-	DPrintf("[nextEnts] applied: %d, committed: %d", l.applied, l.committed)
+	// DPrintf("[nextEnts] applied: %d, committed: %d", l.applied, l.committed)
 	if (l.applied == l.committed) {
 		return []pb.Entry{}
 	}
-	first := l.entries[0].Index
-	DPrintf("first: %d", first)
-	// applied是first的后一个, 因此需要加1, 而:右边加1是因为切片右边是开区间
-	return l.entries[l.applied-first+1:l.committed-first+1]
+	first := l.firstLogIndex()
+	// DPrintf("first: %d, entries: %v", first, l.entries)
+	// applied+1才是下一个没有被应用的日志的index,然后减去1就是在数组中的下标, 而:右边加1是因为切片右边是开区间
+	return l.entries[l.applied+1-first:l.committed-first+1]
 }
 
 // LastIndex return the last index of the log entries

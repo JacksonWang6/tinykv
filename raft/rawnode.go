@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -49,6 +48,7 @@ type Ready struct {
 
 	// Entries specifies entries to be saved to stable storage BEFORE
 	// Messages are sent.
+	// 这个就是存储将要被持久化到stable storage中的日志条目, 所以之后的advaance操作会用这个里面的最后一条日志的index来更新stabled
 	Entries []pb.Entry
 
 	// Snapshot specifies the snapshot to be saved to stable storage.
@@ -57,6 +57,7 @@ type Ready struct {
 	// CommittedEntries specifies entries to be committed to a
 	// store/state-machine. These have previously been committed to stable
 	// store.
+	// 这个就是存放已经提及但是还没有被应用的, 所以advace会用这个的最后一条的日志的index来更新applied
 	CommittedEntries []pb.Entry
 
 	// Messages specifies outbound messages to be sent AFTER Entries are
@@ -70,12 +71,25 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	//因为softstate与hardState的值取决于是否发生变化, 所以我们得保存它之前的值, 然后来比较是否发生变化
+	prevSoftState *SoftState
+	prevHardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	raft := newRaft(config)
+	hardState, _, _ := raft.RaftLog.storage.InitialState()
+	rawNode := RawNode{
+		Raft: raft,
+		prevHardState: hardState,
+		prevSoftState: &SoftState{
+			Lead:      raft.Lead,
+			RaftState: raft.State,
+		},
+	}
+	return &rawNode, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,19 +157,75 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	curHardState := pb.HardState{
+		Term:                 rn.Raft.Term,
+		Vote:                 rn.Raft.Vote,
+		Commit:               rn.Raft.RaftLog.committed,
+	}
+	curSoftState := SoftState{
+		Lead:      rn.Raft.Lead,
+		RaftState: rn.Raft.State,
+	}
+	ready := Ready{
+		SoftState:        nil,
+		HardState:        pb.HardState{},
+		Entries:          rn.Raft.RaftLog.unstableEntries(),
+		Snapshot:         pb.Snapshot{},
+		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
+		Messages:         nil,
+	}
+	if isHardStateEqual(curHardState, rn.prevHardState) == false {
+		ready.HardState = curHardState
+		rn.prevHardState = ready.HardState
+	}
+	if isSoftStateEqual(curSoftState, *rn.prevSoftState) == false {
+		ready.SoftState = &curSoftState
+		rn.prevSoftState = &curSoftState
+	}
+	// DPrintf("[%d] [Ready] %v", rn.Raft.id, ready)
+	return ready
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
-	return false
+	// 判断是否rn.Raft.RaftLog.unstableEntries()、rn.Raft.RaftLog.nextEnts()、rn.Raft.msgs是否都为空，
+	// 若都为空返回false
+	var res bool
+	if len(rn.Raft.RaftLog.unstableEntries()) == 0 && len(rn.Raft.RaftLog.nextEnts()) == 0 && len(rn.Raft.msgs) == 0 {
+		res = false
+	} else {
+		// for debug
+		//if len(rn.Raft.RaftLog.unstableEntries()) != 0 {
+		//	fmt.Printf("unstableEntries: %v\n", rn.Raft.RaftLog.unstableEntries())
+		//}
+		//if len(rn.Raft.RaftLog.nextEnts()) != 0 {
+		//	fmt.Printf("nextEnts: %v\n", rn.Raft.RaftLog.nextEnts())
+		//}
+		//if len(rn.Raft.msgs) != 0 {
+		//	fmt.Printf("msgs: %v\n", rn.Raft.msgs)
+		//}
+		//
+		res = true
+	}
+	return res
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	// 通过rawnode里的ready中的Entrie等数据来修改raft中的applied index, stabled log index等数据
+	// 原来是这里存在问题, Debug de的我好辛苦啊
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardState = rd.HardState
+	}
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+	if len(rd.CommittedEntries) > 0 {
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
 }
 
 // GetProgress return the the Progress of this node and its peers, if this
