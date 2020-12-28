@@ -170,19 +170,19 @@ func (rn *RawNode) Ready() Ready {
 		SoftState:        nil,
 		HardState:        pb.HardState{},
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
-		Snapshot:         pb.Snapshot{},
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
-		Messages:         nil,
+		Messages:         rn.Raft.msgs,
 	}
 	if isHardStateEqual(curHardState, rn.prevHardState) == false {
 		ready.HardState = curHardState
-		rn.prevHardState = ready.HardState
+		rn.prevHardState = curHardState
 	}
 	if isSoftStateEqual(curSoftState, *rn.prevSoftState) == false {
 		ready.SoftState = &curSoftState
 		rn.prevSoftState = &curSoftState
 	}
 	// DPrintf("[%d] [Ready] %v", rn.Raft.id, ready)
+	rn.Raft.msgs = make([]pb.Message, 0)
 	return ready
 }
 
@@ -195,17 +195,6 @@ func (rn *RawNode) HasReady() bool {
 	if len(rn.Raft.RaftLog.unstableEntries()) == 0 && len(rn.Raft.RaftLog.nextEnts()) == 0 && len(rn.Raft.msgs) == 0 {
 		res = false
 	} else {
-		// for debug
-		//if len(rn.Raft.RaftLog.unstableEntries()) != 0 {
-		//	fmt.Printf("unstableEntries: %v\n", rn.Raft.RaftLog.unstableEntries())
-		//}
-		//if len(rn.Raft.RaftLog.nextEnts()) != 0 {
-		//	fmt.Printf("nextEnts: %v\n", rn.Raft.RaftLog.nextEnts())
-		//}
-		//if len(rn.Raft.msgs) != 0 {
-		//	fmt.Printf("msgs: %v\n", rn.Raft.msgs)
-		//}
-		//
 		res = true
 	}
 	return res

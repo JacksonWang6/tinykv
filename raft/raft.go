@@ -179,7 +179,8 @@ func newRaft(c *Config) *Raft {
 		Prs:              make(map[uint64]*Progress),
 		State:            StateFollower,
 		votes:            make(map[uint64]bool),
-		msgs:             []pb.Message{},
+		// 这个bug藏得太深了,空数组应该是nil,不应该是[],我也不知道为什么
+		msgs:             nil,
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
@@ -190,21 +191,37 @@ func newRaft(c *Config) *Raft {
 		peers: c.peers,
 		electionRandomTimeOut: c.ElectionTick,
 	}
+	// fix bug: panic find no region for 3020....
+	hardState, confState, _ := r.RaftLog.storage.InitialState()
+	if c.peers == nil {
+		r.peers = confState.GetNodes()
+	}
+	// fmt.Printf("peers: %v", c.peers)
+	lastindex := r.RaftLog.LastIndex()
 	// Prs这个比较特殊, 是一个map,我们现在来初始化它
 	for _, peer := range r.peers {
 		// DPrintf("[%d] 正在构造Raft实例 peer = %d", r.id, peer)
+		if peer == r.id {
+			r.Prs[peer] = &Progress{
+				Match: lastindex,
+				// 因为storege里面的源码显示log的下标从1开始
+				Next:  lastindex+1,
+			}
+			continue
+		}
 		r.Prs[peer] = &Progress{
 			Match: 0,
 			// 因为storege里面的源码显示log的下标从1开始
-			Next:  1,
+			Next:  lastindex+1,
 		}
 	}
 
 	// 根据测试用例, 我们还要从hardState中获取vote和term: TestLeaderElectionOverwriteNewerLogs2AB
-	hardState, _, _ := r.RaftLog.storage.InitialState()
-	r.Vote = hardState.Vote
-	r.Term = hardState.Term
-	r.RaftLog.committed = hardState.Commit
+	// hardState, _, _ := r.RaftLog.storage.InitialState()
+	// update: 改用Get函数,而不是直接获得对应的属性,因为函数增加了错误处理
+	r.Vote = hardState.GetVote()
+	r.Term = hardState.GetTerm()
+	r.RaftLog.committed = hardState.GetCommit()
 	// DPrintf("%v\n", r.RaftLog.entries)
 	DPrintf("[%d] [Term: %d] 创建Raft实例", r.id, r.Term)
 	return &r
@@ -219,7 +236,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// 不对, 导致比较日志新旧的时候出现了问题, 还得好好研究一下日志这一块, 有点难顶
 	// update: 现在终于有点懂了, 把log以及storage里面的几个辅助函数实现了之后世界美好了好多,唉,没想到这两个文件提供了这么多有用的函数
 	prevLogIndex := r.Prs[to].Next-1				// 将要发送给对方的log的前一条log的下标以及任期号,用来让对方比较新旧
-	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+	// 增加了错误处理
+	if err != nil {
+		panic(err)
+	}
 	msg := pb.Message{
 		MsgType:              pb.MessageType_MsgAppend,
 		To:                   to,
@@ -227,15 +248,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Term:                 r.Term,
 		LogTerm:              prevLogTerm, // Note: 现在非常担心这里可能出现下标越界
 		Index:                prevLogIndex,
-		Entries:              []*pb.Entry{},
+		Entries:              nil,
 		Commit:               r.RaftLog.committed,	// 让对方知道哪些条目是已经可以提交的了
-		Snapshot:             nil,
-		Reject:               false,
-		XXX_NoUnkeyedLiteral: struct{}{},
-		XXX_unrecognized:     nil,
-		XXX_sizecache:        0,
 	}
 	// 判断自己的日志里面是否有可以添加的
+	// DPrintf("len: %d", len(r.RaftLog.entries))
 	if r.Prs[to].Next <= r.RaftLog.LastIndex() {
 		// DPrintf("正在添加日志条目...")
 		// BUG here: index并不是这一个日志在entries中的下标, 太坑了, 所以导致这里appendEntry了个寂寞
@@ -251,7 +268,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 		//	DPrintf("eee %v", entry)
 		//	msg.Entries = append(msg.Entries, &entry)
 		//}
-		for i := r.Prs[to].Next-first; i < r.RaftLog.LastIndex(); i++ {
+		// DPrintf("r.Prs[to].Next-first: %d, r.RaftLog.LastIndex()-first: %d", r.Prs[to].Next-first, r.RaftLog.LastIndex()-first)
+		// 万万没想到, 我竟然在2b把2a的bug找出来了,一个非常大的感悟, bug越早发现越好,否则越到后面调试越困难
+		for i := r.Prs[to].Next-first; i < r.RaftLog.LastIndex()-first; i++ {
 			msg.Entries = append(msg.Entries, &r.RaftLog.entries[i])
 		}
 		DPrintf("[%d] 发送 entries 给 [%d]: %v", r.id, to, msg.Entries)
@@ -275,13 +294,8 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		Term:                 r.Term,
 		LogTerm:              0,
 		Index:                0,
-		Entries:              nil,
 		Commit:               0,
-		Snapshot:             nil,
 		Reject:               false,
-		XXX_NoUnkeyedLiteral: struct{}{},
-		XXX_unrecognized:     nil,
-		XXX_sizecache:        0,
 	}
 	r.msgs = append(r.msgs, msg)
 	DPrintf("[%d] [Term: %d] 向 [%d] 发送心跳包", r.id, r.Term, to)

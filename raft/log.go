@@ -72,7 +72,7 @@ func newLog(storage Storage) *RaftLog {
 		storage:         storage,
 		//  in here you also need to interact with the upper application by the Storage interface defined
 		//  in raft/storage.go to get the persisted data like log entries and snapshot.
-		pendingSnapshot: &storage.(*MemoryStorage).snapshot,
+		// pendingSnapshot: &storage.(*MemoryStorage).snapshot,
 		// 这两个变量赋啥值啊qwq
 		committed: None,
 		applied: None,
@@ -89,13 +89,6 @@ func newLog(storage Storage) *RaftLog {
 	raftLog.stabled = last
 	raftLog.applied = first-1
 	// 我终于知道这里为什么会panic了, 因为InitialState里面直接解引用了snapshot, 但是却并没有对nil进行判断
-	snapshot, _ := storage.Snapshot()
-	var hardState pb.HardState
-	if snapshot.GetMetadata() != nil {
-		hardState, _, _ = storage.InitialState()
-	}
-
-	raftLog.committed = hardState.Commit
 	// first+1是因为下标为0的位置是一个空的无意义的log, last加1是因为切片操作右边是开区间
 	if first > last {
 		raftLog.entries = []pb.Entry{}
@@ -117,7 +110,7 @@ func (l *RaftLog) maybeCompact() {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	// fix bug, 这里的stabled是index,不是下标哇
-	if (l.stabled+1 > l.LastIndex()) {
+	if l.stabled+1 > l.LastIndex() {
 		return []pb.Entry{}
 	}
 	first, _ := l.storage.FirstIndex()
@@ -130,7 +123,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	// fix bug, 如果没判断这个空的情况, 会报panic
 	// DPrintf("[nextEnts] applied: %d, committed: %d", l.applied, l.committed)
-	if (l.applied == l.committed) {
+	if l.applied == l.committed {
 		return []pb.Entry{}
 	}
 	first := l.firstLogIndex()
@@ -167,14 +160,6 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// first, _ := l.storage.FirstIndex()
 	// first -= 1
 	last, _ := l.storage.LastIndex()
-	// end := l.LastIndex()
-	//if i < first || i > end {
-	//	return None, nil
-	//} else if i > last {
-	//	return l.entries[i-last-1].Term, nil
-	//} else {
-	//	return l.storage.Term(i)
-	//}
 	if i > last {
 		fi := l.entries[0].Index
 		return l.entries[i-fi].Term, nil
