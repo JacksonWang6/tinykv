@@ -96,6 +96,7 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	defer txn.Discard()
 	startKey := meta.RaftLogKey(ps.region.Id, low)
 	endKey := meta.RaftLogKey(ps.region.Id, high)
+	// fmt.Printf("startkey: %v, endkey: %v\n", startKey, endKey)
 	iter := txn.NewIterator(badger.DefaultIteratorOptions)
 	defer iter.Close()
 	for iter.Seek(startKey); iter.Valid(); iter.Next() {
@@ -130,10 +131,12 @@ func (ps *PeerStorage) Term(idx uint64) (uint64, error) {
 	if idx == ps.truncatedIndex() {
 		return ps.truncatedTerm(), nil
 	}
+	// 在这里进行错误检查
 	if err := ps.checkRange(idx, idx+1); err != nil {
 		return 0, err
 	}
 	if ps.truncatedTerm() == ps.raftState.LastTerm || idx == ps.raftState.LastIndex {
+		// fmt.Printf("run here: %d\n", ps.raftState.LastIndex)
 		return ps.raftState.LastTerm, nil
 	}
 	var entry eraftpb.Entry
@@ -210,6 +213,8 @@ func (ps *PeerStorage) checkRange(low, high uint64) error {
 	if low > high {
 		return errors.Errorf("low %d is greater than high %d", low, high)
 	} else if low <= ps.truncatedIndex() {
+		// 如果最小的比已经截断的最大的index还要大,那么就返回ErrCompacted
+		// fmt.Printf("ErrCompacted")
 		return raft.ErrCompacted
 	} else if high > ps.raftState.LastIndex+1 {
 		return errors.Errorf("entries' high %d is out of bound, lastIndex %d",
@@ -308,6 +313,33 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	// 我们还需要在最开始特判entries是否为空, 不然之后的获取最后一个日志条目的操作会出错
+	// fmt.Printf("%v\n", entries)
+	if len(entries) == 0 {
+		// 什么也不做
+		return nil
+	}
+	// 根据测试, 这里我们需要做的工作就是把entries里面的东西给他append进去
+	// 根据指导书, 这里应该用setmeta, 但是具体用法应该不像测试用例的那样,因为我们这里明显是log条目
+	// 于是全局搜索发现runner_test.go里面有一个用法的示例
+	// raftWb.SetMeta(meta.RaftLogKey(regionId, i), &eraftpb.Entry{Data: []byte("entry")})
+	// fix bug: 这里的index不是数组下标,就是index
+	last := entries[len(entries)-1].Index
+	regionId := ps.region.GetId()
+	for _, entry := range entries {
+		err := raftWB.SetMeta(meta.RaftLogKey(regionId, entry.Index), &entry)
+		if err != nil {
+			log.Infof("SetMeta error")
+			return err
+		}
+	}
+
+	// TODO: delete any previously appended log entries which will never be committed.
+
+	// fix bug: 最后需要更新lastindex以及lastTerm, 初始时lastindex为5,导致第一个测试的index为5的那个点过不了
+	// 然后又发现如果需要获得最后一条日志的index与任期号,那么我们需要对这次传进来的entries进行判断
+	ps.raftState.LastIndex = last
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	return nil
 }
 
@@ -328,10 +360,40 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+// ALREADY PASS ALL peer_storage tests!!! ^_^
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+	// what this function does is to save the data in raft.Ready to badger,
+	// including append log entries and save the Raft hard state.
+	// To append log entries, simply save all log entries at raft.Ready.Entries to raftdb and
+	// delete any previously appended log entries which will never be committed.
+	// Also update the peer storage’s RaftLocalState and save it to raftdb.
+	raftWB := new(engine_util.WriteBatch)
+	// append log entries
+	err := ps.Append(ready.Entries, raftWB)
+	if err != nil {
+		log.Infof("Append error")
+		return nil, err
+	}
+	// TODO: 我是谁,我在哪?我接下来需要干嘛?
+	if !raft.IsEmptyHardState(ready.HardState) {
+		// 不为空说明发生了变化
+		// update peer storage’s RaftLocalState.HardState
+		ps.raftState.HardState = &ready.HardState
+	}
+	// save it to raftdb. 利用setMata
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	// 一共有两个db, 一个是raftdb, 一个是kvdb, writeBatch存进哪一个呢
+	// save it to raftdb, because raftdb stores raft log and RaftLocalState
+	// and RaftLocalState Used to store HardState of the current Raft and the last Log Index.
+	raftWB.WriteToDB(ps.Engines.Raft)
+	// 这里目前不太清楚返回的applySnapResult怎样赋值
+	applySnapResult := ApplySnapResult{
+		PrevRegion: nil,
+		Region:     nil,
+	}
+	return &applySnapResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {
