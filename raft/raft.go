@@ -239,6 +239,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	// 增加了错误处理
 	if err != nil {
+		// 这个错误处理帮大忙了啊, 2B会概率性的出现这个panic
 		panic(err)
 	}
 	msg := pb.Message{
@@ -270,7 +271,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 		//}
 		// DPrintf("r.Prs[to].Next-first: %d, r.RaftLog.LastIndex()-first: %d", r.Prs[to].Next-first, r.RaftLog.LastIndex()-first)
 		// 万万没想到, 我竟然在2b把2a的bug找出来了,一个非常大的感悟, bug越早发现越好,否则越到后面调试越困难
-		for i := r.Prs[to].Next-first; i < r.RaftLog.LastIndex()-first; i++ {
+		// update: 我裂开了,这里虽然之前发现了bug,但是fix的时候不够仔细,还是错了
+		//		   导致后来出现了cb.callback的时候一直说errLeader
+		for i := r.Prs[to].Next-first; i <= r.RaftLog.LastIndex()-first; i++ {
 			msg.Entries = append(msg.Entries, &r.RaftLog.entries[i])
 		}
 		DPrintf("[%d] 发送 entries 给 [%d]: %v", r.id, to, msg.Entries)

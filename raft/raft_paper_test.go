@@ -906,8 +906,8 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 	msgs := r.readMessages()
 	for _, m := range msgs {
 		// 终于找到bug了, msgs里面最开始几个是心跳包的回应 msgtype: MsgHeartbeat, len(m.entries): 0
-		DPrintf("msgtype: %v, len(m.entries): %d, m.entries[0].data: %v\n",
-			m.MsgType, len(m.Entries), m.Entries[0].GetData())
+		//DPrintf("msgtype: %v, len(m.entries): %d, m.entries[0].data: %v\n",
+		//	m.MsgType, len(m.Entries), m.Entries[0].GetData())
 		if m.MsgType != pb.MessageType_MsgAppend || len(m.Entries) != 1 || m.Entries[0].Data != nil {
 			panic("not a message to append noop entry")
 		}

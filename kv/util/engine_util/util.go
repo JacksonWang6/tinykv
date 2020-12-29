@@ -2,10 +2,20 @@ package engine_util
 
 import (
 	"bytes"
+	"log"
 
 	"github.com/Connor1996/badger"
 	"github.com/golang/protobuf/proto"
 )
+
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 func KeyWithCF(cf string, key []byte) []byte {
 	return append([]byte(cf+"_"), key...)

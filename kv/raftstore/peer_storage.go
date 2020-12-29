@@ -213,8 +213,8 @@ func (ps *PeerStorage) checkRange(low, high uint64) error {
 	if low > high {
 		return errors.Errorf("low %d is greater than high %d", low, high)
 	} else if low <= ps.truncatedIndex() {
-		// 如果最小的比已经截断的最大的index还要大,那么就返回ErrCompacted
-		// fmt.Printf("ErrCompacted")
+		// 如果最小的比已经截断的最大的index还要小,那么就返回ErrCompacted
+		log.Infof("ErrCompacted, low: %v, ps.truncatedIndex(): %v", low, ps.truncatedIndex())
 		return raft.ErrCompacted
 	} else if high > ps.raftState.LastIndex+1 {
 		return errors.Errorf("entries' high %d is out of bound, lastIndex %d",
@@ -369,6 +369,11 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// To append log entries, simply save all log entries at raft.Ready.Entries to raftdb and
 	// delete any previously appended log entries which will never be committed.
 	// Also update the peer storage’s RaftLocalState and save it to raftdb.
+	if ready == nil {
+		log.Infof("%v ready == nil", ps.Tag)
+	} else {
+		log.Infof("%v 正在SaveReadyState: %v", ps.Tag, ready)
+	}
 	raftWB := new(engine_util.WriteBatch)
 	// append log entries
 	err := ps.Append(ready.Entries, raftWB)

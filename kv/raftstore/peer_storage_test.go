@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/Connor1996/badger"
@@ -32,6 +33,7 @@ func newTestPeerStorageFromEnts(t *testing.T, ents []eraftpb.Entry) *PeerStorage
 	raftWB := new(engine_util.WriteBatch)
 	require.Nil(t, peerStore.Append(ents[1:], raftWB))
 	applyState := peerStore.applyState
+	// 原来ents[0]在这里做的处理,说得通了
 	applyState.TruncatedState = &rspb.RaftTruncatedState{
 		Index: ents[0].Index,
 		Term:  ents[0].Term,
@@ -57,6 +59,7 @@ func newTestEntry(index, term uint64) eraftpb.Entry {
 	}
 }
 
+// PASS this test
 func TestPeerStorageTerm(t *testing.T) {
 	ents := []eraftpb.Entry{
 		newTestEntry(3, 3), newTestEntry(4, 4), newTestEntry(5, 5),
@@ -66,6 +69,9 @@ func TestPeerStorageTerm(t *testing.T) {
 		term uint64
 		err  error
 	}{
+		// 我看了半天,终于明白啦,嗯,别想着一口气把全部的代码看完,一个一个测试的过才是真理
+		// 对于这里的第一个点,我们可以看到它的idx是2, 而我们的entries里面最小的index也是3, 所以, 让我们查找index为2的日志的term
+		// 那么就会返回一个已经被打包的err
 		{2, 0, raft.ErrCompacted},
 		{3, 3, nil},
 		{4, 4, nil},
@@ -95,6 +101,7 @@ func getMetaKeyCount(t *testing.T, peerStore *PeerStorage) int {
 	count := 0
 	metaStart := meta.RegionMetaPrefixKey(regionID)
 	metaEnd := meta.RegionMetaPrefixKey(regionID + 1)
+	fmt.Printf("metastart: %v, metaend: %v\n", metaStart, metaEnd)
 	err := peerStore.Engines.Kv.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
@@ -109,6 +116,7 @@ func getMetaKeyCount(t *testing.T, peerStore *PeerStorage) int {
 	require.Nil(t, err)
 	raftStart := meta.RegionRaftPrefixKey(regionID)
 	raftEnd := meta.RegionRaftPrefixKey(regionID + 1)
+	fmt.Printf("raftstart: %v, raftend: %v\n", raftStart, raftEnd)
 	err = peerStore.Engines.Kv.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
@@ -155,6 +163,7 @@ func TestPeerStorageClearMeta(t *testing.T) {
 	assert.Equal(t, 0, getMetaKeyCount(t, peerStore))
 }
 
+// PASS this test
 func TestPeerStorageEntries(t *testing.T) {
 	ents := []eraftpb.Entry{
 		newTestEntry(3, 3),
@@ -223,6 +232,7 @@ func TestPeerStorageAppend(t *testing.T) {
 		// truncate the existing entries and append
 		{[]eraftpb.Entry{newTestEntry(4, 5)}, []eraftpb.Entry{newTestEntry(4, 5)}},
 		// direct append
+		// 控制变量法表明是这里出现了 ErrUnavailable 的错误
 		{
 			[]eraftpb.Entry{newTestEntry(6, 5)},
 			[]eraftpb.Entry{newTestEntry(4, 4), newTestEntry(5, 5), newTestEntry(6, 5)},

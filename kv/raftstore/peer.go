@@ -261,6 +261,7 @@ func (p *peer) LeaderId() uint64 {
 }
 
 func (p *peer) IsLeader() bool {
+	// log.Infof("state: %v, id: %v", p.RaftGroup.Raft.State, p.PeerId())
 	return p.RaftGroup.Raft.State == raft.StateLeader
 }
 
@@ -370,7 +371,7 @@ func (p *peer) sendRaftMessage(msg eraftpb.Message, trans Transport) error {
 	if toPeer == nil {
 		return fmt.Errorf("failed to lookup recipient peer %v in region %v", msg.To, p.regionId)
 	}
-	log.Debugf("%v, send raft msg %v from %v to %v", p.Tag, msg.MsgType, fromPeer, toPeer)
+	log.Debugf("%v, send raft msg type: %v: content: %v from %v to %v", p.Tag, msg.MsgType, msg, fromPeer, toPeer)
 
 	sendMsg.FromPeer = &fromPeer
 	sendMsg.ToPeer = toPeer

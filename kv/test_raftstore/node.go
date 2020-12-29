@@ -213,6 +213,12 @@ func (c *NodeSimulator) CallCommandOnStore(storeID uint64, request *raft_cmdpb.R
 		return nil, nil
 	}
 
+	// 在这里得到resp的,就是等待timeout,如果超时了就返回nil
 	resp := cb.WaitRespWithTimeout(timeout)
+	if resp == nil {
+		log.Infof("CallCommandOnStore resp is nil")
+	} else {
+		log.Infof("success: %v", resp)
+	}
 	return resp, cb.Txn
 }

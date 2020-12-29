@@ -2,6 +2,9 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -43,6 +46,157 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	// So HandleRaftReady should get the ready from Raft module and do corresponding actions
+	// like persisting log entries, applying committed entries and sending raft messages to other peers
+	// through the network.
+	// 当一个 RawNode ready 之后，我们需要对 ready 里面的数据做一系列处理，包括将 entries 写入 Storage，
+	// 发送 messages，apply committed_entries 以及 advance 等。
+	// 这些全都在 Peer 的 handle_raft_ready 系列函数里面完成。(来自官方博客)
+	if d.RaftGroup.HasReady() {
+		rd := d.RaftGroup.Ready()
+		// saveToStorage(rd.State, rd.Entries, rd.Snapshot)
+		d.peerStorage.SaveReadyState(&rd)
+		// send(rd.Messages)
+		// Transport 对象，用来让 Peer 发送 message
+		log.Infof("[%v] 正在发送msgs: %v", d.Tag, rd.Messages)
+		d.peer.Send(d.ctx.trans, rd.Messages)
+
+		// process(entry), 就是将已经提交的条目应用到状态机当中
+		// 这一步的处理过程非常复杂
+		// 官方博客讲的太精辟啦, 我把一些重要信息粘贴过来啦, 解决了我的不少疑惑
+		// 对于 committed_entries 的处理，Peer 会解析实际的 command，调用对应的处理流程，执行对应的函数
+		// 为了保证数据的一致性，Peer 在 execute 的时候，都只会将修改的数据保存到 RocksDB 的 WriteBatch 里面，
+		// 然后在最后原子的写入到 RocksDB，写入成功之后，才修改对应的内存元信息。如果写入失败，我们会直接 panic，保证数据的完整性。
+		if len(rd.CommittedEntries) > 0 {
+			// 判断是否存在已经提交了的日志
+			for _, entry := range rd.CommittedEntries {
+				d.process(entry)
+			}
+			// Do not forget to update and persist the apply state when applying the log entries.
+			kvWB := new(engine_util.WriteBatch)
+			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+			applyState := d.peerStorage.applyState
+			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), applyState)
+			kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+		}
+		// s.Node.Advance(rd)
+		// 更新状态机的状态
+		d.RaftGroup.Advance(rd)
+	}
+}
+
+func (d *peerMsgHandler) process(entry pb.Entry) {
+	log.Infof("[%v] 正在process Entry: %v", d.Tag, entry)
+	var command raft_cmdpb.Request
+	// 解析出实际的command
+	err := command.Unmarshal(entry.Data)
+	if err != nil {
+		// 解析发生错误,跳过这条信息的处理
+		return
+	}
+	log.Infof("[%v] 解析出来的命令: %v", d.Tag, command)
+	// 如果是修改的操作,那么我们需要将修改后的状态应用到状态机里面
+	// You can regard kvdb as the state machine mentioned in Raft paper
+	if command.CmdType == raft_cmdpb.CmdType_Put || command.CmdType == raft_cmdpb.CmdType_Delete {
+		kvWB := new(engine_util.WriteBatch)
+		switch command.CmdType {
+		case raft_cmdpb.CmdType_Put:
+			log.Infof("[%v] 正在执行SetCF", d.Tag)
+			kvWB.SetCF(command.Put.Cf, command.Put.Key, command.Put.Value)
+		case raft_cmdpb.CmdType_Delete:
+			log.Infof("[%v] 正在执行DeleteCF", d.Tag)
+			kvWB.DeleteCF(command.Delete.Cf, command.Delete.Key)
+		}
+		log.Infof("[%v] 写入kvDB", d.Tag)
+		kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+	}
+
+	// Record the callback of the command when proposing, and return the callback after applying.
+	// 处理完毕之后,还需要看看是否执行回调函数
+	// returns the response by callback
+	if len(d.proposals) == 0 {
+		log.Infof("[%v] proposals为空", d.Tag)
+		return
+	}
+	p := d.proposals[0]
+	if entry.Index == p.index {
+		if entry.Term != p.term {
+			log.Infof("[%v] ErrRespStaleCommand", d.Tag)
+			NotifyStaleReq(p.term, p.cb)
+		} else {
+			log.Infof("[%v] 正在执行回调,返回response", d.Tag)
+			log.Infof("[%v] command type: %v", d.Tag, command.CmdType)
+			switch command.CmdType {
+			case raft_cmdpb.CmdType_Put:
+				// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
+				response := raft_cmdpb.RaftCmdResponse{
+					Header:               &raft_cmdpb.RaftResponseHeader{
+						CurrentTerm:          entry.Term,
+					},
+					Responses:            []*raft_cmdpb.Response{
+						&raft_cmdpb.Response{
+							CmdType:              raft_cmdpb.CmdType_Put,
+							Put:                  &raft_cmdpb.PutResponse{},
+						},
+					},
+				}
+				p.cb.Done(&response)
+			case raft_cmdpb.CmdType_Get:
+				value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, command.Get.Cf, command.Get.Key)
+				if err != nil {
+					log.Infof("[%v] Get操作失败,kvDB当中不存在 cf: %v key: %v",
+						d.Tag, command.Get.Cf, command.Get.Key)
+					p.cb.Done(ErrResp(err))
+					break
+				}
+				response := raft_cmdpb.RaftCmdResponse{
+					Header:               &raft_cmdpb.RaftResponseHeader{
+						CurrentTerm:          entry.Term,
+					},
+					Responses:            []*raft_cmdpb.Response{
+						&raft_cmdpb.Response{
+							CmdType:              raft_cmdpb.CmdType_Get,
+							Get:                  &raft_cmdpb.GetResponse{
+								Value:                value,
+							},
+						},
+					},
+				}
+				p.cb.Done(&response)
+			case  raft_cmdpb.CmdType_Delete:
+				// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
+				response := raft_cmdpb.RaftCmdResponse{
+					Header:               &raft_cmdpb.RaftResponseHeader{
+						CurrentTerm:          entry.Term,
+					},
+					Responses:            []*raft_cmdpb.Response{
+						&raft_cmdpb.Response{
+							CmdType:              raft_cmdpb.CmdType_Delete,
+							Delete:               &raft_cmdpb.DeleteResponse{},
+						},
+					},
+				}
+				p.cb.Done(&response)
+			case raft_cmdpb.CmdType_Snap:
+				response := raft_cmdpb.RaftCmdResponse{
+					Header:               &raft_cmdpb.RaftResponseHeader{
+						CurrentTerm:          entry.Term,
+					},
+					Responses:            []*raft_cmdpb.Response{
+						&raft_cmdpb.Response{
+							CmdType:              raft_cmdpb.CmdType_Snap,
+							Snap:              	  &raft_cmdpb.SnapResponse{
+								Region:               d.Region(),
+							},
+						},
+					},
+				}
+				p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				p.cb.Done(&response)
+			}
+		}
+		d.proposals = d.proposals[1:]
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -82,6 +236,9 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	leaderID := d.LeaderId()
 	if !d.IsLeader() {
 		leader := d.getPeerFromCache(leaderID)
+		// ErrNotLeader: the raft command is proposed on a follower. so use it to let client try other peers.
+		// 框架代码已经在这里帮我们实现好了,所以我们只用调用该函数,然后判断err是否为nil并返回err即可\
+		log.Infof("[%v] ErrNotLeader, leader: %v", d.Tag, leader)
 		return &util.ErrNotLeader{RegionId: regionID, Leader: leader}
 	}
 	// peer_id must be the same as peer's.
@@ -110,10 +267,32 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
+		log.Infof("[%v] err preProposeRaftCommand", d.Tag)
 		cb.Done(ErrResp(err))
 		return
 	}
 	// Your Code Here (2B).
+	if len(msg.Requests) == 0 {
+		engine_util.DPrintf("proposeRaftCommand: msg.Requests为空, 提交无效")
+		return
+	}
+
+	for _, request := range msg.Requests {
+		data, err := request.Marshal()
+		if err != nil {
+			panic(err)
+		}
+		// 向RaftGroup提交command
+		d.RaftGroup.Propose(data)
+		lastIndex := d.RaftGroup.Raft.RaftLog.LastIndex()
+		lastTerm := d.RaftGroup.Raft.RaftLog.LastTerm()
+		// 添加新的proposal
+		d.proposals = append(d.proposals, &proposal{
+			index: lastIndex,
+			term:  lastTerm,
+			cb:    cb,
+		})
+	}
 }
 
 func (d *peerMsgHandler) onTick() {

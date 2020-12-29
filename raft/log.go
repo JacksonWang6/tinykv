@@ -159,8 +159,10 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// 我想我之前可能一直理解错了, 其实raftLog里面的entries是把所有的日志都存储起来了, 只不过其中有一部分还被持久化到storage中了而已
 	// first, _ := l.storage.FirstIndex()
 	// first -= 1
-	last, _ := l.storage.LastIndex()
-	if i > last {
+	// fix bug: 这里出现了一个非常诡异的bug, 就是在raft里面调用term,err了,然后panic了,原因就是在这个函数中执行的是最下面的
+	// 那个storage的term函数,这个函数在peerstorage里面的实现中有一个check函数,他会与ps.truncatedIndex()相比较,而这里比它小了,
+	// 就err了
+	if len(l.entries) > 0 && i >= l.entries[0].Index {
 		fi := l.entries[0].Index
 		return l.entries[i-fi].Term, nil
 	}

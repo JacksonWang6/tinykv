@@ -193,8 +193,10 @@ func (m *MockSchedulerClient) GetRegion(ctx context.Context, key []byte) (*metap
 }
 
 func (m *MockSchedulerClient) getRegionLocked(key []byte) (*metapb.Region, *metapb.Peer) {
+	// 因为这里的findRegion的结果是nil
 	result := m.findRegion(key)
 	if result == nil {
+		// engine_util.DPrintf("find Region fail")
 		return nil, nil
 	}
 
@@ -463,8 +465,14 @@ func (m *MockSchedulerClient) findRegion(key []byte) *regionItem {
 		result = i.(*regionItem)
 		return false
 	})
-
+	// engine_util.DPrintf("key %v", key)
 	if result == nil || !result.Contains(key) {
+		// 调试信息说明根本没有找到这个键对应的region
+		//if result == nil {
+		//	engine_util.DPrintf("result == nil")
+		//} else {
+		//	engine_util.DPrintf("result doesn't contions %v", key)
+		//}
 		return nil
 	}
 

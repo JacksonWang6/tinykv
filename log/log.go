@@ -42,7 +42,7 @@ const (
 	LOG_LEVEL_FATAL = LOG_LEVEL_NONE | LogLevel(LOG_FATAL)
 	LOG_LEVEL_ERROR = LOG_LEVEL_FATAL | LogLevel(LOG_ERROR)
 	LOG_LEVEL_WARN  = LOG_LEVEL_ERROR | LogLevel(LOG_WARNING)
-	LOG_LEVEL_INFO  = LOG_LEVEL_WARN | LogLevel(LOG_INFO)
+	LOG_LEVEL_INFO  = LOG_LEVEL_WARN | LogLevel(LOG_INFO) //| LogLevel(LOG_DEBUG)
 	LOG_LEVEL_DEBUG = LOG_LEVEL_INFO | LogLevel(LOG_DEBUG)
 	LOG_LEVEL_ALL   = LOG_LEVEL_DEBUG
 )
@@ -271,10 +271,11 @@ func New() *Logger {
 
 func NewLogger(w io.Writer, prefix string) *Logger {
 	var level LogLevel
-	if l := os.Getenv("LOG_LEVEL"); len(l) != 0 {
-		level = StringToLogLevel(os.Getenv("LOG_LEVEL"))
-	} else {
-		level = LOG_LEVEL_INFO
-	}
+	//if l := os.Getenv("LOG_LEVEL"); len(l) != 0 {
+	//	level = StringToLogLevel(os.Getenv("LOG_LEVEL"))
+	//} else {
+	//	level = LOG_LEVEL_INFO
+	//}
+	level = LOG_LEVEL_ALL
 	return &Logger{_log: log.New(w, prefix, LstdFlags), level: level, highlighting: true}
 }

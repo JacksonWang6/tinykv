@@ -188,10 +188,12 @@ func (c *Cluster) Request(key []byte, reqs []*raft_cmdpb.Request, timeout time.D
 		resp, txn := c.CallCommandOnLeader(&req, timeout)
 		if resp == nil {
 			// it should be timeouted innerly
+			log.Infof("resp is nil")
 			SleepMS(100)
 			continue
 		}
 		if resp.Header.Error != nil {
+			log.Infof("resp.header.error")
 			SleepMS(100)
 			continue
 		}
@@ -219,6 +221,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 		request.Header.Peer = leader
 		resp, txn := c.CallCommand(request, 1*time.Second)
 		if resp == nil {
+			log.Infof("CallCommandOnLeader resp is nil")
 			log.Debugf("can't call command %s on leader %d of region %d", request.String(), leader.GetId(), regionID)
 			newLeader := c.LeaderOfRegion(regionID)
 			if leader == newLeader {
@@ -236,6 +239,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 			continue
 		}
 		if resp.Header.Error != nil {
+			log.Infof("CallCommandOnLeader resp.header.error")
 			err := resp.Header.Error
 			if err.GetStaleCommand() != nil || err.GetEpochNotMatch() != nil || err.GetNotLeader() != nil {
 				log.Debugf("encouter retryable err %+v", resp)
@@ -268,6 +272,9 @@ func (c *Cluster) GetRegion(key []byte) *metapb.Region {
 		if region != nil {
 			return region
 		}
+		// panic: find no region for 30203030303030303030
+		// 原因是我们GetRegion获得的返回值一直是nil
+		// engine_util.DPrintf("region is nil\n")
 		// We may meet range gap after split, so here we will
 		// retry to get the region again.
 		SleepMS(20)

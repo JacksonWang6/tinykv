@@ -520,6 +520,8 @@ func (s *Snap) saveMetaFile() error {
 	return nil
 }
 
+// 在做2b的时候出现了一个[error] failed to generate snapshot!!!的错误
+// 经过排查发现是从这里发生的
 func (s *Snap) Build(dbSnap *badger.Txn, region *metapb.Region, snapData *rspb.RaftSnapshotData, stat *SnapStatistics, deleter SnapshotDeleter) error {
 	if s.Exists() {
 		err := s.validate()
