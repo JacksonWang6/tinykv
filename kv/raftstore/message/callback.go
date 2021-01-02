@@ -36,7 +36,7 @@ func (cb *Callback) WaitResp() *raft_cmdpb.RaftCmdResponse {
 func (cb *Callback) WaitRespWithTimeout(timeout time.Duration) *raft_cmdpb.RaftCmdResponse {
 	select {
 	case <-cb.done:
-		log.Infof("确实是从cb.done信道过来了, cb.Resp: %v", cb.Resp)
+		//log.Infof("确实是从cb.done信道过来了, cb.Resp: %v", cb.Resp)
 		return cb.Resp
 	case <-time.After(timeout):
 		return cb.Resp

@@ -104,32 +104,42 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	// fix bug, 这里的stabled是index,不是下标哇
-	if l.stabled+1 > l.LastIndex() {
-		return []pb.Entry{}
+	// 这里在2C出大问题了啊
+	ents := make([]pb.Entry, 0)
+	for i := l.stabled+1; i <= l.LastIndex(); i++{
+		var entry pb.Entry
+		if len(l.entries) == 0 || l.entries[0].Index > i || i == 0 {
+			entry = pb.Entry{Term: 0, Index: l.LastIndex()}
+		} else {
+			entry = l.entries[i - l.entries[0].Index]
+		}
+		ents = append(ents, entry)
 	}
-	first, _ := l.storage.FirstIndex()
-	// DPrintf("debug: stabled %d first %d entry %v", l.stabled, first, l.entries)
-	return l.entries[l.stabled+1-first:]
+	return ents
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	// fix bug, 如果没判断这个空的情况, 会报panic
-	// DPrintf("[nextEnts] applied: %d, committed: %d", l.applied, l.committed)
-	if l.applied == l.committed {
-		return []pb.Entry{}
+	// 我发现2C里面出现crash之后, 我之前log里写的函数好多都有问题啊
+	ent := make([]pb.Entry, 0)
+	for i := l.applied+1; i <= l.committed; i++ {
+		var entry pb.Entry
+		if len(l.entries) == 0 || l.entries[0].Index > i || i == 0 {
+			entry = pb.Entry{Term: 0, Index: l.LastIndex()}
+		} else {
+			entry = l.entries[i - l.entries[0].Index]
+		}
+		ent = append(ent, entry)
 	}
-	first := l.firstLogIndex()
-	// DPrintf("first: %d, entries: %v", first, l.entries)
-	// applied+1才是下一个没有被应用的日志的index,然后减去1就是在数组中的下标, 而:右边加1是因为切片右边是开区间
-	return l.entries[l.applied+1-first:l.committed-first+1]
+	return ent
 }
 
 // LastIndex return the last index of the log entries
@@ -138,10 +148,17 @@ func (l *RaftLog) LastIndex() uint64 {
 	// 终于有一点懂了, logEntry的结构如文件最前面的注释所示,里面有一部分是已经被持久化到storage里面的,还有一部分没有被持久化
 	// 我们需要根据是否存在没有被持久化的来判断这个index怎么获得
 	var res uint64
-	if len(l.entries) > 0 {
-		res = l.entries[len(l.entries)-1].Index
+	// 出大问题了, 2C的snapshot的测试挂掉了,挂掉的原因是我们storage是空的,只是从快照读取了东西, 所以这里需要特判一下快照是否存在
+	// 但是这个问题只有接收了快照的第一个tick存在,因为下一个tick在ready函数里面该变量就会置为nil,并且hasReady会为true,最后applysnapshot
+	// 将状态应用到底层
+	if !IsEmptySnap(l.pendingSnapshot) {
+		res = l.pendingSnapshot.Metadata.Index
 	} else {
-		res, _ = l.storage.LastIndex()
+		if len(l.entries) > 0 {
+			res = l.entries[len(l.entries)-1].Index
+		} else {
+			res, _ = l.storage.LastIndex()
+		}
 	}
 	return res
 }
@@ -166,5 +183,17 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		fi := l.entries[0].Index
 		return l.entries[i-fi].Term, nil
 	}
-	return l.storage.Term(i)
+	// fix bug: 引入了snapshot之后,如同LatIndex一样,这个也需要做出修改
+	term, err := l.storage.Term(i)
+	// 如果不在storage里面会返回一个ErrUnavailable的错误
+	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+		// 在快照里面我们只知道最后一个日志的index和term
+		if i == l.pendingSnapshot.Metadata.Index {
+			term = l.pendingSnapshot.Metadata.Term
+			err = nil
+		} else if i < l.pendingSnapshot.Metadata.Index {
+			err = ErrCompacted
+		}
+	}
+	return term, err
 }

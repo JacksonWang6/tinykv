@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -181,8 +182,13 @@ func (rn *RawNode) Ready() Ready {
 		ready.SoftState = &curSoftState
 		rn.prevSoftState = &curSoftState
 	}
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		log.Infof("[%d] ready 递交了 snapshot", rn.Raft.id)
+		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+		// rn.Raft.RaftLog.pendingSnapshot = nil
+	}
 	// DPrintf("[%d] [Ready] %v", rn.Raft.id, ready)
-	rn.Raft.msgs = make([]pb.Message, 0)
+	rn.Raft.msgs = nil
 	return ready
 }
 
@@ -206,14 +212,21 @@ func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 	// 通过rawnode里的ready中的Entrie等数据来修改raft中的applied index, stabled log index等数据
 	// 原来是这里存在问题, Debug de的我好辛苦啊
-	if !IsEmptyHardState(rd.HardState) {
-		rn.prevHardState = rd.HardState
-	}
 	if len(rd.Entries) > 0 {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
 	if len(rd.CommittedEntries) > 0 {
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
+	// 应该在advance里面进行更新
+	if !IsEmptySnap(&rd.Snapshot) {
+		raftlog := rn.Raft.RaftLog
+		index := rd.Snapshot.Metadata.Index
+		raftlog.stabled = max(raftlog.stabled, index)
+		raftlog.applied = max(raftlog.applied, index)
+		if !IsEmptySnap(raftlog.pendingSnapshot) && raftlog.pendingSnapshot.Metadata.Index == index {
+			raftlog.pendingSnapshot = nil
+		}
 	}
 }
 

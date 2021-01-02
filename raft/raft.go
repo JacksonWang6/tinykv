@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
 	"sort"
@@ -222,15 +223,47 @@ func newRaft(c *Config) *Raft {
 	r.Vote = hardState.GetVote()
 	r.Term = hardState.GetTerm()
 	r.RaftLog.committed = hardState.GetCommit()
+	if c.Applied > 0 {
+		r.RaftLog.applied = c.Applied
+	}
 	// DPrintf("%v\n", r.RaftLog.entries)
 	DPrintf("[%d] [Term: %d] 创建Raft实例", r.id, r.Term)
 	return &r
+}
+
+func (r *Raft) sendSnapShot(to uint64) {
+	log.Infof("[%d] 正在向 %d 发送snapshot", r.id, to)
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		if err == ErrSnapshotTemporarilyUnavailable {
+			// snapshot正在生成,暂时不可用
+			log.Infof("[%d] snapshot ErrSnapshotTemporarilyUnavailable", r.id)
+			return
+		}
+		log.Infof("[%d] snapshot err", r.id)
+		// 真的是奇怪,ErrSnapshotTemporarilyUnavailable这个错误居然会运行到这里然后panic? 不应该在上面那个if那里return吗
+		// fix bug: it is not raft.ErrSnapshotTemporarilyUnavailable, it is just ErrSnapshotTemporarilyUnavailable
+		panic(err)
+	}
+	msg := pb.Message{
+		MsgType:              pb.MessageType_MsgSnapshot,
+		To:                   to,
+		From:                 r.id,
+		Snapshot:             &snapshot,
+		Term: 				  r.Term,
+	}
+	log.Infof("[%d] 成功向 %d 发出snapshot", r.id, to)
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
+	if to == r.id{
+		return false
+	}
 	// log下标从1开始
 	// 本来2aa过了, 结果写2ab写了一半之后测了一下2aa又挂了, 心态崩了, 调试了一下之后发现, 挂掉的原因就是心跳包与日志包的log的index等
 	// 不对, 导致比较日志新旧的时候出现了问题, 还得好好研究一下日志这一块, 有点难顶
@@ -239,6 +272,14 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	// 增加了错误处理
 	if err != nil {
+		if err == ErrCompacted {
+			// 出现这种错误就是因为这个follower的日志太老了,它的下一个需要的字段在leader里面已经被compacted了
+			// 也就是说storage里面没有这个entry了,所以只能发snapshot给它了
+			log.Infof("[%d] 向 %d 发送了一个 snapshot", r.id, to)
+			r.sendSnapShot(to)
+			return true
+		}
+
 		// 这个错误处理帮大忙了啊, 2B会概率性的出现这个panic
 		panic(err)
 	}
@@ -582,6 +623,9 @@ func (r *Raft) handleVoteResponse(m pb.Message) {
 func (r *Raft) handleHeartBeatResponse(m pb.Message) {
 	if m.Reject {
 		r.becomeFollower(m.Term, None)
+	} else {
+		// 心累, 这个2A的bug在2C当中才找出来, 找了一天
+		r.sendAppend(m.From)
 	}
 }
 
@@ -694,6 +738,9 @@ func (r *Raft) appendEntry(m pb.Message) {
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	// 2aa: 框架代码这里的状态机的思想的应用简直太经典了
+	//if m.MsgType == pb.MessageType_MsgSnapshot {
+	//	log.Infof("[%d] 收到了 snapshot的install请求", r.id)
+	//}
 	switch r.State {
 	case StateFollower:
 		switch m.MsgType {
@@ -709,6 +756,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handlerVote(m)
 		case pb.MessageType_MsgRequestVoteResponse:
 			r.handleVoteResponse(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		}
 	case StateCandidate:
 		switch m.MsgType {
@@ -723,6 +772,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleHeartbeat(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handlerVote(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		}
 	case StateLeader:
 		switch m.MsgType {
@@ -879,6 +930,73 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	//  follower should call handleSnapshot to handle it, which namely just restore
+	//  the raft internal state like term, commit index and membership information, ect,
+	//  from the eraftpb.SnapshotMetadata in the message
+	log.Infof("[%d] [Term: %d] 正在处理来自 [%d] [Term: %d] 的snapshot", r.id, r.Term, m.From, m.Term)
+	if m.Snapshot == nil {
+		log.Infof("!!! snapshot is nil")
+		return
+	}
+	// 代码结构参考了etcd的实现
+	if r.restore(*m.Snapshot) {
+		r.becomeFollower(m.Term, m.From)
+		// 哇, 为什么没有早点知道etcd, 它的结构设计的真好, 我这样发消息搞得代码好臃肿
+		msg := pb.Message{
+			MsgType:              pb.MessageType_MsgAppendResponse,
+			To:                   m.From,
+			From:                 r.id,
+			Term:                 r.Term,
+			Index:                r.RaftLog.LastIndex(),
+			Reject:               false,
+		}
+		r.msgs = append(r.msgs, msg)
+	} else {
+		msg := pb.Message{
+			MsgType:              pb.MessageType_MsgAppendResponse,
+			To:                   m.From,
+			From:                 r.id,
+			Term:                 r.Term,
+			Index:                r.RaftLog.committed,
+			Reject:               false,
+		}
+		r.msgs = append(r.msgs, msg)
+	}
+}
+
+func (r *Raft) restore(s pb.Snapshot) bool {
+	if s.Metadata.Index <= r.RaftLog.committed {
+		// 如果现存的⽇志条⽬与快照中最后包含的⽇志条⽬具有相同的索引值和任期号，则保留其后的⽇志 条⽬并进⾏回复
+		// 出现这种情况说明快照里面的东西这台机器都存了
+		if r.RaftLog.entries[0].Index <= s.Metadata.Index {
+			// 仅保留其后的⽇志
+			r.RaftLog.entries = r.RaftLog.entries[s.Metadata.Index-r.RaftLog.entries[0].Index+1:]
+		}
+		return false
+	}
+	// 保存快照⽂件，丢弃具有较⼩索引的任何现有或部分快照
+	r.RaftLog.pendingSnapshot = &s
+	log.Infof("我这里确实保存了快照文件: %v", r.RaftLog.pendingSnapshot)
+	// fix bug: 这里不如不丢弃的话, 由于这些日志是已经
+	// 否则的话丢弃整个⽇志
+	r.RaftLog.entries = nil
+	// 使⽤快照重置状态机
+	meta := s.Metadata
+	// restore the raft internal state like term, commit index and membership information
+	// 内部仅更新了 committed，并没有更新 applied。这是因为 raft-rs 仅关心 Raft 日志的部分，
+	// 至于如何把日志中的内容更新到真正的状态机中，是应用程序的任务。(官方博客)
+	// r.RaftLog.applied = meta.Index // fix bug here
+	r.RaftLog.committed = meta.Index
+
+	// （并加载快照的集群配置） membership information
+	// 因为 Snapshot 包含了 Leader 上最新的信息，而 Leader 上的 Configuration 是可能跟 Follower 不同的。
+	r.Prs = make(map[uint64]*Progress)
+	r.peers = nil
+	for _, peer := range meta.ConfState.Nodes {
+		r.peers = append(r.peers, peer)
+		r.Prs[peer] = &Progress{}
+	}
+	return true
 }
 
 // addNode add a new node to raft group

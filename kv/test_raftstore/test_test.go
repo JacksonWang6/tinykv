@@ -207,7 +207,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 		clnts[i] = make(chan int, 1)
 	}
 	for i := 0; i < 3; i++ {
-		// log.Printf("Iteration %v\n", i)
+		log.Infof("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
 		go SpawnClientsAndWait(t, ch_clients, nclients, func(cli int, t *testing.T) {
@@ -228,10 +228,25 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 					start := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", 0)
 					end := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
 					log.Infof("%d: client new scan %v-%v\n", cli, start, end)
+					// BUG: 这里scan的时候出现了一个诡异的问题, 类似于下面这样:
+					// want:x 2 0 y
+					// got: x 2 0 yx 2 0 yx 2 0 y
+					// 后来经过不断的打日志, 我发现了问题就是我的key出问题了:
+					//[info] inner***: iter.Item().Key() [50 32 48 48 48 48 48 48 48 48] end [50 32 48 48 48 48 48 48 48 49]
+					//[info] debug: value: [120 32 50 32 48 32 121], values: [[120 32 50 32 48 32 121]]
+					//[info] inner***: iter.Item().Key() [50 32 48 48 48 48 48 48 48 48 255 255 255 255 255 255 255 246] end [50 32 48 48 48 48 48 48 48 49]
+					//[info] debug: value: [120 32 50 32 48 32 121], values: [[120 32 50 32 48 32 121] [120 32 50 32 48 32 121]]
+					//[info] inner***: iter.Item().Key() [50 32 48 48 48 48 48 48 48 48 255 255 255 255 255 255 255 246 255 255 255 255 255 255 255 245] end [50 32 48 48 48 48 48 48 48 49]
+					//[info] debug: value: [120 32 50 32 48 32 121], values: [[120 32 50 32 48 32 121] [120 32 50 32 48 32 121] [120 32 50 32 48 32 121]]
+					//[info] inner***: iter.Item().Key() [51 32 48 48 48 48 48 48 48 48] end [50 32 48 48 48 48 48 48 48 49]
 					values := cluster.Scan([]byte(start), []byte(end))
 					v := string(bytes.Join(values, []byte("")))
 					if v != last {
+						//log.Infof("%d: client scan %v-%v\n", cli, start, end)
 						log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
+					} else {
+						//log.Infof("%d: client scan %v-%v\n", cli, start, end)
+						//log.Infof("get correct value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
 					}
 				}
 			}
@@ -263,7 +278,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			time.Sleep(electionTimeout)
 		}
 
-		// log.Printf("wait for clients\n")
+		log.Infof("wait for clients\n")
 		<-ch_clients
 
 		if crash {
@@ -321,6 +336,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 					}
 					truncatedIdx := state.TruncatedState.Index
 					appliedIdx := state.AppliedIndex
+					// 暂时还没有实现raftstore里面的内容,测试时挂在了这里
 					if appliedIdx-truncatedIdx > 2*uint64(maxraftlog) {
 						t.Fatalf("logs were not trimmed (%v - %v > 2*%v)", appliedIdx, truncatedIdx, maxraftlog)
 					}
@@ -446,6 +462,8 @@ func TestPersistPartitionUnreliable2B(t *testing.T) {
 	GenericTest(t, "2B", 5, true, true, true, -1, false, false)
 }
 
+// ??? 我就写了Raft中的snapshot,还没有实现raftstore里面的,咋这个测试就已经能通过了,好吧,至少证明Raft里面实现的没有大问题
+// 好吧,只是概率能过
 func TestOneSnapshot2C(t *testing.T) {
 	cfg := config.NewTestConfig()
 	cfg.RaftLogGcCountLimit = 10
@@ -471,13 +489,14 @@ func TestOneSnapshot2C(t *testing.T) {
 		}
 	}
 
+	// 无法与1通信了
 	cluster.AddFilter(
 		&PartitionFilter{
 			s1: []uint64{1},
 			s2: []uint64{2, 3},
 		},
 	)
-
+	log.Infof("1与2,3通信隔离了")
 	// write some data to trigger snapshot
 	for i := 100; i < 115; i++ {
 		cluster.MustPutCF(cf, []byte(fmt.Sprintf("k%d", i)), []byte(fmt.Sprintf("v%d", i)))
@@ -485,6 +504,7 @@ func TestOneSnapshot2C(t *testing.T) {
 	cluster.MustDeleteCF(cf, []byte("k2"))
 	time.Sleep(500 * time.Millisecond)
 	MustGetCfNone(cluster.engines[1], cf, []byte("k100"))
+	log.Infof("1与2,3通信隔离解除了")
 	cluster.ClearFilters()
 
 	// Now snapshot must applied on

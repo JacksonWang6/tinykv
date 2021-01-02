@@ -218,7 +218,7 @@ func (c *NodeSimulator) CallCommandOnStore(storeID uint64, request *raft_cmdpb.R
 	if resp == nil {
 		log.Infof("CallCommandOnStore resp is nil")
 	} else {
-		log.Infof("success: %v", resp)
+// 		log.Infof("success: %v", resp)
 	}
 	return resp, cb.Txn
 }

@@ -55,12 +55,14 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.RaftGroup.HasReady() {
 		rd := d.RaftGroup.Ready()
 		// saveToStorage(rd.State, rd.Entries, rd.Snapshot)
-		d.peerStorage.SaveReadyState(&rd)
+		_, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
+			panic(err)
+		}
 		// send(rd.Messages)
-		// Transport 对象，用来让 Peer 发送 message
-		log.Infof("[%v] 正在发送msgs: %v", d.Tag, rd.Messages)
-		d.peer.Send(d.ctx.trans, rd.Messages)
-
+		// Transport 对象，用来让 Peer 发送 message, 这个msgs就是Raft信箱中的msgs, 最开始在Ready函数里面还忘记了给这个赋值
+		// log.Infof("[%v] 正在发送msgs: %v", d.Tag, rd.Messages)
+		d.Send(d.ctx.trans, rd.Messages)
 		// process(entry), 就是将已经提交的条目应用到状态机当中
 		// 这一步的处理过程非常复杂
 		// 官方博客讲的太精辟啦, 我把一些重要信息粘贴过来啦, 解决了我的不少疑惑
@@ -69,15 +71,21 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// 然后在最后原子的写入到 RocksDB，写入成功之后，才修改对应的内存元信息。如果写入失败，我们会直接 panic，保证数据的完整性。
 		if len(rd.CommittedEntries) > 0 {
 			// 判断是否存在已经提交了的日志
+			kvWB := new(engine_util.WriteBatch)
 			for _, entry := range rd.CommittedEntries {
-				d.process(entry)
+				d.process(&entry, kvWB)
 			}
 			// Do not forget to update and persist the apply state when applying the log entries.
-			kvWB := new(engine_util.WriteBatch)
 			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-			applyState := d.peerStorage.applyState
-			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), applyState)
-			kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			var err error
+			err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				panic(err)
+			}
+			err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			if err != nil {
+				panic(err)
+			}
 		}
 		// s.Node.Advance(rd)
 		// 更新状态机的状态
@@ -85,118 +93,178 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 }
 
-func (d *peerMsgHandler) process(entry pb.Entry) {
-	log.Infof("[%v] 正在process Entry: %v", d.Tag, entry)
-	var command raft_cmdpb.Request
-	// 解析出实际的command
-	err := command.Unmarshal(entry.Data)
-	if err != nil {
-		// 解析发生错误,跳过这条信息的处理
-		return
+// 我想我懂了: 客户端提交请求的时候是只能提交给那一届任期的leader的, 然后那个时候的leader的proposals里面会添加对应的回调函数cb
+// 当这一条日志被提交然后应用的时候每台机器就会在proposals里面找看看有没有回调函数,只有这条日志提交的时候为leader的机器才会有cb,
+// 但是这台机器可能挂掉了又重连了换届了之类的, 所以index+term唯一标示了它, 缺一不可
+func (d *peerMsgHandler) getProposal (index, term uint64) proposal {
+	if len(d.proposals) == 0 {
+		log.Infof("[%v] proposals为空", d.Tag)
+		return proposal{
+			cb: nil,
+		}
 	}
+	p := d.proposals[0]
+	if term < p.term {
+		return proposal{
+			cb: nil,
+		}
+	}
+	d.proposals = d.proposals[1:]
+	if p.index == index {
+		return *p
+	}
+	// 否则没有找到
+	log.Infof("没有找对对应下标的proposal")
+	return proposal{
+		cb: nil,
+	}
+}
+
+// 处理那四种普通请求的函数
+func (d *peerMsgHandler) processRequest (entry *pb.Entry, kvWB *engine_util.WriteBatch, cmd *raft_cmdpb.RaftCmdRequest,) {
+	command := cmd.Requests[0]
 	log.Infof("[%v] 解析出来的命令: %v", d.Tag, command)
 	// 如果是修改的操作,那么我们需要将修改后的状态应用到状态机里面
 	// You can regard kvdb as the state machine mentioned in Raft paper
 	if command.CmdType == raft_cmdpb.CmdType_Put || command.CmdType == raft_cmdpb.CmdType_Delete {
-		kvWB := new(engine_util.WriteBatch)
 		switch command.CmdType {
 		case raft_cmdpb.CmdType_Put:
-			log.Infof("[%v] 正在执行SetCF", d.Tag)
+			log.Infof("[%v] 正在执行SetCF: cf: %v key: %v, value: %v", d.Tag, command.Put.Cf, command.Put.Key, command.Put.Value)
 			kvWB.SetCF(command.Put.Cf, command.Put.Key, command.Put.Value)
 		case raft_cmdpb.CmdType_Delete:
-			log.Infof("[%v] 正在执行DeleteCF", d.Tag)
+			log.Infof("[%v] 正在执行DeleteCF: key: %v", d.Tag, command.Delete.Key)
 			kvWB.DeleteCF(command.Delete.Cf, command.Delete.Key)
 		}
 		log.Infof("[%v] 写入kvDB", d.Tag)
-		kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+		// fix bug: 不应该在这里写入, 而且这里的清空貌似也存在bug, 得等到后面统一写入
+		//kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+		//// 清空kvWB
+		//kvWB = new(engine_util.WriteBatch)
 	}
-
 	// Record the callback of the command when proposing, and return the callback after applying.
 	// 处理完毕之后,还需要看看是否执行回调函数
 	// returns the response by callback
-	if len(d.proposals) == 0 {
-		log.Infof("[%v] proposals为空", d.Tag)
+	p := d.getProposal(entry.Index, entry.Term)
+	if p.cb == nil {
 		return
 	}
-	p := d.proposals[0]
-	if entry.Index == p.index {
-		if entry.Term != p.term {
-			log.Infof("[%v] ErrRespStaleCommand", d.Tag)
-			NotifyStaleReq(p.term, p.cb)
-		} else {
-			log.Infof("[%v] 正在执行回调,返回response", d.Tag)
-			log.Infof("[%v] command type: %v", d.Tag, command.CmdType)
-			switch command.CmdType {
-			case raft_cmdpb.CmdType_Put:
-				// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
-				response := raft_cmdpb.RaftCmdResponse{
-					Header:               &raft_cmdpb.RaftResponseHeader{
-						CurrentTerm:          entry.Term,
-					},
-					Responses:            []*raft_cmdpb.Response{
-						&raft_cmdpb.Response{
-							CmdType:              raft_cmdpb.CmdType_Put,
-							Put:                  &raft_cmdpb.PutResponse{},
-						},
-					},
-				}
-				p.cb.Done(&response)
-			case raft_cmdpb.CmdType_Get:
-				value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, command.Get.Cf, command.Get.Key)
-				if err != nil {
-					log.Infof("[%v] Get操作失败,kvDB当中不存在 cf: %v key: %v",
-						d.Tag, command.Get.Cf, command.Get.Key)
-					p.cb.Done(ErrResp(err))
-					break
-				}
-				response := raft_cmdpb.RaftCmdResponse{
-					Header:               &raft_cmdpb.RaftResponseHeader{
-						CurrentTerm:          entry.Term,
-					},
-					Responses:            []*raft_cmdpb.Response{
-						&raft_cmdpb.Response{
-							CmdType:              raft_cmdpb.CmdType_Get,
-							Get:                  &raft_cmdpb.GetResponse{
-								Value:                value,
-							},
-						},
-					},
-				}
-				p.cb.Done(&response)
-			case  raft_cmdpb.CmdType_Delete:
-				// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
-				response := raft_cmdpb.RaftCmdResponse{
-					Header:               &raft_cmdpb.RaftResponseHeader{
-						CurrentTerm:          entry.Term,
-					},
-					Responses:            []*raft_cmdpb.Response{
-						&raft_cmdpb.Response{
-							CmdType:              raft_cmdpb.CmdType_Delete,
-							Delete:               &raft_cmdpb.DeleteResponse{},
-						},
-					},
-				}
-				p.cb.Done(&response)
-			case raft_cmdpb.CmdType_Snap:
-				response := raft_cmdpb.RaftCmdResponse{
-					Header:               &raft_cmdpb.RaftResponseHeader{
-						CurrentTerm:          entry.Term,
-					},
-					Responses:            []*raft_cmdpb.Response{
-						&raft_cmdpb.Response{
-							CmdType:              raft_cmdpb.CmdType_Snap,
-							Snap:              	  &raft_cmdpb.SnapResponse{
-								Region:               d.Region(),
-							},
-						},
-					},
-				}
-				p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-				p.cb.Done(&response)
-			}
-		}
-		d.proposals = d.proposals[1:]
+	if p.term != entry.Term {
+		log.Infof("[%v] ErrRespStaleCommand", d.Tag)
+		NotifyStaleReq(p.term, p.cb)
+		return
 	}
+	log.Infof("[%v] 正在执行回调,返回response, command type: %v", d.Tag, command.CmdType)
+	response := raft_cmdpb.RaftCmdResponse{
+		Header:               &raft_cmdpb.RaftResponseHeader{
+			CurrentTerm:          entry.Term,
+		},
+	}
+	switch command.CmdType {
+	case raft_cmdpb.CmdType_Put:
+		// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
+		response.Responses = []*raft_cmdpb.Response{
+			&raft_cmdpb.Response{
+				CmdType:              raft_cmdpb.CmdType_Put,
+				Put:                  &raft_cmdpb.PutResponse{},
+			},
+		}
+	case raft_cmdpb.CmdType_Get:
+		value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, command.Get.Cf, command.Get.Key)
+		if err != nil {
+			log.Infof("[%v] Get操作失败,kvDB当中不存在 cf: %v key: %v",
+				d.Tag, command.Get.Cf, command.Get.Key)
+			p.cb.Done(ErrResp(err))
+			return
+		}
+		log.Infof("[%v] Get操作成功, key: %v, value: %v", d.Tag, command.Get.Key, value)
+		response.Responses = []*raft_cmdpb.Response{
+			&raft_cmdpb.Response{
+				CmdType:              raft_cmdpb.CmdType_Get,
+				Get:                  &raft_cmdpb.GetResponse{
+					Value:                value,
+				},
+			},
+		}
+	case  raft_cmdpb.CmdType_Delete:
+		// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
+		response.Responses = []*raft_cmdpb.Response{
+			&raft_cmdpb.Response{
+				CmdType:              raft_cmdpb.CmdType_Delete,
+				Delete:               &raft_cmdpb.DeleteResponse{},
+			},
+		}
+	case raft_cmdpb.CmdType_Snap:
+		response.Responses = []*raft_cmdpb.Response{
+			&raft_cmdpb.Response{
+				CmdType:              raft_cmdpb.CmdType_Snap,
+				Snap:              	  &raft_cmdpb.SnapResponse{
+					Region:               d.Region(),
+				},
+			},
+		}
+		p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+	}
+	p.cb.Done(&response)
+}
+
+func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, kvWB *engine_util.WriteBatch, cmd *raft_cmdpb.RaftCmdRequest) {
+	adminCommand := cmd.AdminRequest
+	switch adminCommand.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		log.Infof("[%v] 正在处理AdminCmdType_CompactLog命令: %v", d.Tag, adminCommand)
+		// CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is
+		// in the RaftApplyState
+		compactLog, applyState := adminCommand.GetCompactLog(), d.peerStorage.applyState
+		if compactLog.CompactIndex >= applyState.TruncatedState.Index {
+			// HandleRaftReady中在apply命令时若发现该命令是CompactLogRequest，则修改TruncatedState
+			applyState.TruncatedState.Index = compactLog.CompactIndex
+			applyState.TruncatedState.Term = compactLog.CompactTerm
+			// 目前只是先写到WB里面, 之后统一写回DB
+			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), applyState)
+			// After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog.
+			// 发送一个raftLogGcTask到raftLogGCTaskSender，在另一个线程中对raftdb中的日志进行压缩
+			// firstIndex字段压根没使用,随便传一个东西好了
+			d.ScheduleCompactLog(0, applyState.TruncatedState.Index)
+		}
+	}
+	// 处理回应
+	p := d.getProposal(entry.Index, entry.Term)
+	if p.cb == nil {
+		return
+	}
+	if p.term != entry.Term {
+		log.Infof("[%v] ErrRespStaleCommand", d.Tag)
+		NotifyStaleReq(p.term, p.cb)
+		return
+	}
+}
+
+// apply已经提交的日志
+// 重构了代码
+func (d *peerMsgHandler) process(entry *pb.Entry, kvWB *engine_util.WriteBatch) error {
+	if entry.Data == nil {
+		log.Infof("entry.Data is nil")
+		return nil
+	}
+	log.Infof("[%v] 正在process Entry: %v", d.Tag, entry)
+	message := &raft_cmdpb.RaftCmdRequest{}
+	err := message.Unmarshal(entry.Data)
+	if err != nil {
+		log.Infof("process Unmarshal error: %v", err)
+		return err
+	}
+	if message.AdminRequest != nil {
+		log.Infof("process admin")
+		d.processAdminRequest(entry, kvWB, message)
+		return nil
+	}
+
+	if len(message.Requests) > 0 {
+		d.processRequest(entry, kvWB, message)
+		return nil
+	}
+	// should not run here
+	panic(0)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -238,7 +306,7 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		leader := d.getPeerFromCache(leaderID)
 		// ErrNotLeader: the raft command is proposed on a follower. so use it to let client try other peers.
 		// 框架代码已经在这里帮我们实现好了,所以我们只用调用该函数,然后判断err是否为nil并返回err即可\
-		log.Infof("[%v] ErrNotLeader, leader: %v", d.Tag, leader)
+		log.Infof("[%v] ErrNotLeader, leaderId: %v", d.Tag, leaderID)
 		return &util.ErrNotLeader{RegionId: regionID, Leader: leader}
 	}
 	// peer_id must be the same as peer's.
@@ -265,34 +333,63 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	//if msg.AdminRequest != nil {
+	//	log.Infof("这里收到了compact请求")
+	//}
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		log.Infof("[%v] err preProposeRaftCommand", d.Tag)
+		log.Infof("这个错误的提交为%v", msg)
 		cb.Done(ErrResp(err))
 		return
 	}
 	// Your Code Here (2B).
-	if len(msg.Requests) == 0 {
-		engine_util.DPrintf("proposeRaftCommand: msg.Requests为空, 提交无效")
-		return
+	// 将代码重构了, 划分成函数, 方便维护
+	if msg.AdminRequest != nil {
+		d.proposeAdminRequest(msg, cb)
+	} else {
+		d.proposeRequest(msg, cb)
 	}
+}
 
-	for _, request := range msg.Requests {
-		data, err := request.Marshal()
+func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	admin := msg.AdminRequest
+	log.Infof("[%v] 正在处理AdminRequest: %v", d.Tag, admin)
+	if admin.CmdType == raft_cmdpb.AdminCmdType_CompactLog {
+		// bug here: 我终于知道为什么一直没有处理那个compact请求了, 因为这里propose请求的时候出现了错误
+		// request, err := admin.Marshal()
+		request, err := msg.Marshal()
+		log.Infof("[%v] 正在处理compact: %v", d.Tag, request)
 		if err != nil {
 			panic(err)
 		}
-		// 向RaftGroup提交command
-		d.RaftGroup.Propose(data)
-		lastIndex := d.RaftGroup.Raft.RaftLog.LastIndex()
-		lastTerm := d.RaftGroup.Raft.RaftLog.LastTerm()
+		log.Infof("正在添加新的proposal, index: %v, term: %v", d.nextProposalIndex(), d.Term())
 		// 添加新的proposal
 		d.proposals = append(d.proposals, &proposal{
-			index: lastIndex,
-			term:  lastTerm,
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
 			cb:    cb,
 		})
+		d.RaftGroup.Propose(request)
 	}
+}
+
+func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// fix bug: 这里就是一条请求, 不是循环处理, 不然会出现解析错误的情况
+	// for _, request := range msg.Requests {
+	data, err := msg.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	log.Infof("正在添加新的proposal, index: %v, term: %v", d.nextProposalIndex(), d.Term())
+	// 添加新的proposal
+	d.proposals = append(d.proposals, &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	})
+	// 向RaftGroup提交command
+	d.RaftGroup.Propose(data)
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -329,6 +426,7 @@ func (d *peerMsgHandler) onRaftBaseTick() {
 	d.ticker.schedule(PeerTickRaft)
 }
 
+// ??? 这个firstIndex字段根本就没有使用
 func (d *peerMsgHandler) ScheduleCompactLog(firstIndex uint64, truncatedIndex uint64) {
 	raftLogGCTask := &runner.RaftLogGCTask{
 		RaftEngine: d.ctx.engine.Raft,
@@ -591,7 +689,9 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 	appliedIdx := d.peerStorage.AppliedIndex()
 	firstIdx, _ := d.peerStorage.FirstIndex()
 	var compactIdx uint64
+	// bug: 这里会频繁触发compact, 原因是trunctedidx没有更新,一直是5
 	if appliedIdx > firstIdx && appliedIdx-firstIdx >= d.ctx.cfg.RaftLogGcCountLimit {
+		log.Infof("applied index: %v, firstidx: %v", appliedIdx, firstIdx)
 		compactIdx = appliedIdx
 	} else {
 		return
@@ -613,6 +713,8 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 	// Create a compact log request and notify directly.
 	regionID := d.regionId
 	request := newCompactLogRequest(regionID, d.Meta, compactIdx, term)
+	// 然后在这里提交compact请求, 讲道理会更新truncateidx啊, 真是奇怪哇
+	log.Infof("提交了 compact请求")
 	d.proposeRaftCommand(request, nil)
 }
 

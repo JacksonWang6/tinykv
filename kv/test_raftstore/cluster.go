@@ -207,6 +207,8 @@ func (c *Cluster) CallCommand(request *raft_cmdpb.RaftCmdRequest, timeout time.D
 	return c.simulator.CallCommandOnStore(storeID, request, timeout)
 }
 
+// 我终于知道为什么有时候会一直输出errnotleader了
+// 看下面这个函数: 想象这种情况, 一个follower掉线了,然后它成为了候选人, 候选人的leader为None, 然后这里就一直请求
 func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeout time.Duration) (*raft_cmdpb.RaftCmdResponse, *badger.Txn) {
 	startTime := time.Now()
 	regionID := request.Header.RegionId
@@ -220,6 +222,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 		}
 		request.Header.Peer = leader
 		resp, txn := c.CallCommand(request, 1*time.Second)
+		// log.Infof("run here")
 		if resp == nil {
 			log.Infof("CallCommandOnLeader resp is nil")
 			log.Debugf("can't call command %s on leader %d of region %d", request.String(), leader.GetId(), regionID)
@@ -239,7 +242,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 			continue
 		}
 		if resp.Header.Error != nil {
-			log.Infof("CallCommandOnLeader resp.header.error")
+			// log.Infof("CallCommandOnLeader resp.header.error")
 			err := resp.Header.Error
 			if err.GetStaleCommand() != nil || err.GetEpochNotMatch() != nil || err.GetNotLeader() != nil {
 				log.Debugf("encouter retryable err %+v", resp)
@@ -247,6 +250,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 					leader = err.GetNotLeader().Leader
 				} else {
 					leader = c.LeaderOfRegion(regionID)
+					log.Infof("run here: leader: %v, region: %v", leader, regionID)
 				}
 				continue
 			}
@@ -362,6 +366,7 @@ func (c *Cluster) MustDeleteCF(cf string, key []byte) {
 }
 
 func (c *Cluster) Scan(start, end []byte) [][]byte {
+	log.Infof("new scan and debug scan: start: %v, end: %v", start, end)
 	req := NewSnapCmd()
 	values := make([][]byte, 0)
 	key := start
@@ -378,7 +383,9 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 		}
 		region := resp.Responses[0].GetSnap().Region
 		iter := raft_storage.NewRegionReader(txn, *region).IterCF(engine_util.CfDefault)
+		// log.Infof("outer***")
 		for iter.Seek(key); iter.Valid(); iter.Next() {
+			// log.Infof("inner***: iter.Item().Key() %v end %v", iter.Item().Key(), end)
 			if engine_util.ExceedEndKey(iter.Item().Key(), end) {
 				break
 			}
@@ -387,6 +394,7 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 				panic(err)
 			}
 			values = append(values, value)
+			// log.Infof("debug: value: %v, values: %v", value, values)
 		}
 		iter.Close()
 

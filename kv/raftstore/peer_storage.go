@@ -160,9 +160,11 @@ func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 		select {
 		case s := <-ps.snapState.Receiver:
 			if s != nil {
+				log.Infof("%v 成功生成snapshot", ps.Tag)
 				snapshot = *s
 			}
 		default:
+			log.Infof("%v snapshot正在生成中", ps.Tag)
 			return snapshot, raft.ErrSnapshotTemporarilyUnavailable
 		}
 		ps.snapState.StateType = snap.SnapState_Relax
@@ -324,7 +326,8 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	// 于是全局搜索发现runner_test.go里面有一个用法的示例
 	// raftWb.SetMeta(meta.RaftLogKey(regionId, i), &eraftpb.Entry{Data: []byte("entry")})
 	// fix bug: 这里的index不是数组下标,就是index
-	last := entries[len(entries)-1].Index
+	lastIdx := entries[len(entries)-1].Index
+	lastTerm := entries[len(entries)-1].Term
 	regionId := ps.region.GetId()
 	for _, entry := range entries {
 		err := raftWB.SetMeta(meta.RaftLogKey(regionId, entry.Index), &entry)
@@ -335,11 +338,14 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	}
 
 	// TODO: delete any previously appended log entries which will never be committed.
-
+	prevIdx, _ := ps.LastIndex()
+	for i := lastIdx+1; i <= prevIdx; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(regionId, i))
+	}
 	// fix bug: 最后需要更新lastindex以及lastTerm, 初始时lastindex为5,导致第一个测试的index为5的那个点过不了
 	// 然后又发现如果需要获得最后一条日志的index与任期号,那么我们需要对这次传进来的entries进行判断
-	ps.raftState.LastIndex = last
-	ps.raftState.LastTerm = entries[len(entries)-1].Term
+	ps.raftState.LastIndex = lastIdx
+	ps.raftState.LastTerm = lastTerm
 	return nil
 }
 
@@ -355,7 +361,51 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	ps.snapState.StateType = snap.SnapState_Applying
+	// send runner.RegionTaskApply task to region worker through PeerStorage.regionSched
+	// and wait until region worker finish.
+	notify := make(chan bool, 1)
+	// fix bug: 这里掉了一个&, 导致了stop集群时卡死了
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.Id,
+		Notifier: notify,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	// wait until region worker finish
+	<-notify
+	log.Infof("regionSched finished")
+	ps.snapState.StateType = snap.SnapState_Relax
+
+	// call ps.clearMeta and ps.clearExtraData to delete stale data
+	if ps.isInitialized() {
+		err := ps.clearMeta(kvWB, raftWB)
+		if err != nil {
+			panic(err)
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	// RaftLocalState
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	// RaftApplyState
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	log.Infof("更新了 TruncatedState.Index: %d", ps.applyState.TruncatedState.Index)
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	// don’t forget to persist these states to kvdb and raftdb, raftdb will setmeta at outer function
+	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState)
+
+	applySnapResult := ApplySnapResult{
+		PrevRegion: ps.region,
+		Region:     snapData.Region,
+	}
+	// update region
+	ps.SetRegion(snapData.Region)
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	return &applySnapResult, nil
 }
 
 // Save memory states to disk.
@@ -371,17 +421,32 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Also update the peer storage’s RaftLocalState and save it to raftdb.
 	if ready == nil {
 		log.Infof("%v ready == nil", ps.Tag)
-	} else {
-		log.Infof("%v 正在SaveReadyState: %v", ps.Tag, ready)
+		return nil, nil
 	}
 	raftWB := new(engine_util.WriteBatch)
+	kvWB := new(engine_util.WriteBatch)
+	var applySnapResult *ApplySnapResult
+	var err error
+	// log.Infof("为什么没有运行到这里?: %v", ready.Snapshot)
+	// 若检测到有Snapshot则调用ApplySnapshot更新相关信息进行处理
+	// 需要先执行这个, 因为snapshot里面regionid可能更新了
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		log.Infof("为什么没有运行到这里?")
+		applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return applySnapResult, err
+		}
+		kvWB.WriteToDB(ps.Engines.Kv)
+	}
 	// append log entries
-	err := ps.Append(ready.Entries, raftWB)
+	err = ps.Append(ready.Entries, raftWB)
 	if err != nil {
 		log.Infof("Append error")
 		return nil, err
 	}
-	// TODO: 我是谁,我在哪?我接下来需要干嘛?
+
+	// To save the hard state is also very easy, just update peer storage’s RaftLocalState.HardState
+	// and save it to raftdb.
 	if !raft.IsEmptyHardState(ready.HardState) {
 		// 不为空说明发生了变化
 		// update peer storage’s RaftLocalState.HardState
@@ -389,16 +454,13 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 	// save it to raftdb. 利用setMata
 	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+
 	// 一共有两个db, 一个是raftdb, 一个是kvdb, writeBatch存进哪一个呢
 	// save it to raftdb, because raftdb stores raft log and RaftLocalState
 	// and RaftLocalState Used to store HardState of the current Raft and the last Log Index.
 	raftWB.WriteToDB(ps.Engines.Raft)
 	// 这里目前不太清楚返回的applySnapResult怎样赋值
-	applySnapResult := ApplySnapResult{
-		PrevRegion: nil,
-		Region:     nil,
-	}
-	return &applySnapResult, nil
+	return applySnapResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {
