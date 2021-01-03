@@ -398,7 +398,7 @@ func (r *Raft) tick() {
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	// 2aa: 这里采用状态机的思想来理解, 身份对应到状态机就是状态,身份的切换就是状态的改变
-	DPrintf("[%d] [Term %d] 成为Follower", r.id, term)
+	DPrintf("[%d] [Term %d] 成为Follower, lead: %v", r.id, term, lead)
 	r.votes = make(map[uint64]bool, 0)
 	r.State = StateFollower
 	r.electionElapsed = 0
@@ -407,6 +407,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.Vote = None
 	r.reject = 0
+	// 标记解除
+	r.leadTransferee = None
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -438,6 +440,8 @@ func (r *Raft) becomeLeader() {
 	DPrintf("[%d] [Term: %d] 成为Leader", r.id, r.Term)
 	r.votes = make(map[uint64]bool, 0)
 	r.State = StateLeader
+	// fix bug: 3A里面要求的, leader的Lead是它自己
+	r.Lead = r.id
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	// 成为领导人之后立即发送空的心跳包给所有的peers
@@ -648,6 +652,52 @@ func (r *Raft) broadcastAppendEntries () {
 	}
 }
 
+func (r *Raft) updateCommit() {
+	// 如果存在一个满足 N > commitIndex 的 N,并且大多数的 matchIndex[i] ≥ N 成立,并且 log[N].term == currentTerm
+	// 成立,那么令 commitIndex 等于这个 N (5.3 和 5.4 节)
+	sortArr := make([]int, 0)
+	for _, peer := range r.peers {
+		DPrintf("sort addr: %d", r.Prs[peer].Match)
+		sortArr = append(sortArr, int(r.Prs[peer].Match))
+	}
+	sort.Ints(sortArr)
+	var newCommitIndex int
+	// fix bug: 测试不讲武德, 居然有一个测试点的服务器台数是偶数 TestLeaderOnlyCommitsLogFromCurrentTerm2AB
+	if len(sortArr) % 2 == 0 {
+		newCommitIndex = sortArr[len(sortArr)/2-1]
+	} else {
+		newCommitIndex = sortArr[len(sortArr)/2]
+	}
+	//if uint64(newCommitIndex) > r.RaftLog.committed {
+	//	r.RaftLog.committed = uint64(newCommitIndex)
+	//}
+	term, _ := r.RaftLog.Term(uint64(newCommitIndex))
+	// DPrintf("term: %d, r.term %d", term, r.Term)
+	// 新的提交更大并且是当前任期的提交,那么可以安全的应用
+	// find bug: 我终于知道为什么commit够了但是没有提交了, 这里最后一条日志的term计算出现了错误
+	if uint64(newCommitIndex) > r.RaftLog.committed && term == r.Term {
+		// fix bug: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+		newCommitIndex = int(min(uint64(newCommitIndex), r.RaftLog.LastIndex()))
+
+		DPrintf("[%d] 新的提交, newcommitIndex=%d", r.id, newCommitIndex)
+		r.RaftLog.committed = uint64(newCommitIndex)
+		// 更新日志提交记录
+		// 从上次apply之后的地方开始提交,一直提交到commit的地方
+		for i := r.RaftLog.applied+1; i <= uint64(newCommitIndex); i++ {
+			// in here you also need to interact with the upper application by the Storage interface
+			// defined in raft/storage.go to get the persisted data like log entries and snapshot.
+			// TODO: 把可以安全应用的数据apply
+		}
+		// 更新已经应用的日志的下标
+		// 按照测试,貌似现在不能更新applied
+		// r.RaftLog.applied = uint64(newCommitIndex)
+		// DPrintf("[%d] 新的apply=%d", r.id, r.RaftLog.applied)
+
+		// TestLeaderSyncFollowerLog2AB 这个测试用例说明当commit被更新之后我们还需要发消息给peers,同步这个消息
+		r.broadcastAppendEntries()
+	}
+}
+
 // 处理AppendEntry的响应包
 func (r *Raft) handleAppendEntriesResponse (m pb.Message) {
 	if m.Reject {
@@ -670,59 +720,78 @@ func (r *Raft) handleAppendEntriesResponse (m pb.Message) {
 		r.Prs[m.From].Next = r.Prs[m.From].Match + 1
 		// fix bug: 在计算commit超过半数的机器时, 忘记更新leader自己的match了, 导致出现错误
 		r.Prs[r.id].Match = r.RaftLog.LastIndex()
-		// 如果存在一个满足 N > commitIndex 的 N,并且大多数的 matchIndex[i] ≥ N 成立,并且 log[N].term == currentTerm
-		// 成立,那么令 commitIndex 等于这个 N (5.3 和 5.4 节)
-		sortArr := make([]int, 0)
-		for _, peer := range r.peers {
-			DPrintf("sort addr: %d", r.Prs[peer].Match)
-			sortArr = append(sortArr, int(r.Prs[peer].Match))
-		}
-		sort.Ints(sortArr)
-		var newCommitIndex int
-		// fix bug: 测试不讲武德, 居然有一个测试点的服务器台数是偶数 TestLeaderOnlyCommitsLogFromCurrentTerm2AB
-		if len(sortArr) % 2 == 0 {
-			newCommitIndex = sortArr[len(sortArr)/2-1]
-		} else {
-			newCommitIndex = sortArr[len(sortArr)/2]
-		}
-
-
-		//if uint64(newCommitIndex) > r.RaftLog.committed {
-		//	r.RaftLog.committed = uint64(newCommitIndex)
-		//}
-		term, _ := r.RaftLog.Term(uint64(newCommitIndex))
-		// DPrintf("term: %d, r.term %d", term, r.Term)
-		// 新的提交更大并且是当前任期的提交,那么可以安全的应用
-		// find bug: 我终于知道为什么commit够了但是没有提交了, 这里最后一条日志的term计算出现了错误
-		if uint64(newCommitIndex) > r.RaftLog.committed && term == r.Term {
-			// fix bug: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
-			newCommitIndex = int(min(uint64(newCommitIndex), r.RaftLog.LastIndex()))
-
-			DPrintf("[%d] 新的提交, newcommitIndex=%d", r.id, newCommitIndex)
-			r.RaftLog.committed = uint64(newCommitIndex)
-			// 更新日志提交记录
-			// 从上次apply之后的地方开始提交,一直提交到commit的地方
-			for i := r.RaftLog.applied+1; i <= uint64(newCommitIndex); i++ {
-				// in here you also need to interact with the upper application by the Storage interface
-				// defined in raft/storage.go to get the persisted data like log entries and snapshot.
-				// TODO: 把可以安全应用的数据apply
+		r.updateCommit()
+		// 在最后做一个判断
+		if r.leadTransferee == m.From {
+			msg := pb.Message{
+				MsgType:              pb.MessageType_MsgTransferLeader,
+				To:                   r.id,
+				From:                 r.leadTransferee,
 			}
-			// 更新已经应用的日志的下标
-			// 按照测试,貌似现在不能更新applied
-			// r.RaftLog.applied = uint64(newCommitIndex)
-			// DPrintf("[%d] 新的apply=%d", r.id, r.RaftLog.applied)
-
-			// TestLeaderSyncFollowerLog2AB 这个测试用例说明当commit被更新之后我们还需要发消息给peers,同步这个消息
-			r.broadcastAppendEntries()
+			r.msgs = append(r.msgs, msg)
 		}
+	}
+}
+
+//  first check the qualification of the transferee (namely transfer target) like:
+//  is the transferee’s log up to date, etc.
+func (r *Raft) checkQualification(id uint64) (bool, error) {
+	if r.Prs[id] == nil {
+		return false, errors.New("not exist")
+	}
+	if r.Prs[id].Match == r.RaftLog.LastIndex() {
+		return true, nil
+	}
+	return false, nil
+}
+
+// 这里有一个比较棘手的问题,就是当transferee不合法的时候,我们需要sendappend, 但是又不能够propose,避免cycle
+// 完了之后我们还得继续执行MessageType_MsgTimeoutNow的逻辑,转换身份
+// 解决办法,利用raft结构体的leadTransferee字段标记一下
+func (r *Raft) handleTransfer(m pb.Message) {
+	valid, err := r.checkQualification(m.From)
+	if err != nil {
+		log.Infof("LeaderTransferToNonExistingNode")
+		return
+	}
+	r.leadTransferee = m.From
+	if valid {
+		// send a MsgTimeoutNow message to the transferee immediately
+		msg := pb.Message{
+			MsgType:              pb.MessageType_MsgTimeoutNow,
+			To:                   m.From,
+			From:                 r.id,
+		}
+		r.msgs = append(r.msgs, msg)
+		// fix bug: 这里leader成为follower是通过日志一样新的follower收到MessageType_MsgTimeoutNow之后发起选举
+		// 然后收到它的投票之后才会发生身份变更, 而不是自己becomeFollower, TestLeaderTransferBack3A
+		// r.becomeFollower(r.Term, m.From)
+		log.Infof("[%d] send MessageType_MsgTimeoutNow to %d", r.id, m.From)
+	} else {
+		// If the transferee’s log is not up to date, the current leader should send a MsgAppend message
+		// to the transferee and stop accepting new proposes in case we end up cycling
+		r.sendAppend(m.From)
 	}
 }
 
 // the leader first calls the 'appendEntry' method to append entries to its log
 func (r *Raft) appendEntry(m pb.Message) {
+	// when TransferLeader stop accepting new proposes in case we end up cycling
+	if r.leadTransferee != None {
+		// 目前暂时这样处理了, 不知道会不会有问题
+		return
+	}
 	for _, entry := range m.Entries {
 		entry.Index = r.RaftLog.LastIndex()+1
 		entry.Term = r.Term
+		if entry.EntryType == pb.EntryType_EntryConfChange {
+			if r.PendingConfIndex > r.RaftLog.applied {
+				entry.EntryType = pb.EntryType_EntryNormal
+				entry.Data = nil
+			} else {
+				r.PendingConfIndex = entry.Index
+			}
+		}
 		DPrintf("***appendEntry***\n[%d] [Term: %d] 正在添加新的entry, Index: %d, Term: %d, entry: %v",
 			r.id, r.Term, entry.Index, entry.Term, *entry)
 		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
@@ -741,6 +810,10 @@ func (r *Raft) Step(m pb.Message) error {
 	//if m.MsgType == pb.MessageType_MsgSnapshot {
 	//	log.Infof("[%d] 收到了 snapshot的install请求", r.id)
 	//}
+	if r.Prs[r.id] == nil {
+		log.Infof("[%d] has been removed", r.id)
+		return nil
+	}
 	switch r.State {
 	case StateFollower:
 		switch m.MsgType {
@@ -758,6 +831,18 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleVoteResponse(m)
 		case pb.MessageType_MsgSnapshot:
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTimeoutNow:
+			r.becomeCandidate()
+			r.launchVote()
+		case pb.MessageType_MsgTransferLeader:
+			// 转发
+			log.Infof("[%d] %v 转发 MessageType_MsgTransferLeader 给 %d", r.id, r.State, r.Lead)
+			msg := pb.Message{
+				MsgType:              pb.MessageType_MsgTransferLeader,
+				To:                   r.Lead,
+				From:                 m.From,
+			}
+			r.msgs = append(r.msgs, msg)
 		}
 	case StateCandidate:
 		switch m.MsgType {
@@ -774,6 +859,9 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handlerVote(m)
 		case pb.MessageType_MsgSnapshot:
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTimeoutNow:
+			r.becomeCandidate()
+			r.launchVote()
 		}
 	case StateLeader:
 		switch m.MsgType {
@@ -792,6 +880,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleHeartbeat(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handlerVote(m)
+		case pb.MessageType_MsgTransferLeader:
+			r.handleTransfer(m)
 		}
 	}
 	return nil
@@ -1002,9 +1092,37 @@ func (r *Raft) restore(s pb.Snapshot) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	flag := false
+	for _, peer := range r.peers {
+		if peer == id {
+			flag = true
+			break
+		}
+	}
+	if !flag {
+		r.peers = append(r.peers, id)
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex()+1,
+		}
+	}
+	r.PendingConfIndex = 0
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	for index, peer := range r.peers {
+		if peer == id {
+			r.peers = append(r.peers[:index], r.peers[index+1:]...)
+			delete(r.Prs, peer)
+			break
+		}
+	}
+	// fix bug: TestCommitAfterRemoveNode3A这个测试挂掉了, 这个测试检测的就是集群成员变化提交之后, 由于节点数发生了变化
+	// 有一些日志也许就可以提交了, 所以我们得重新判断一下
+	if r.State == StateLeader {
+		r.updateCommit()
+	}
+	r.PendingConfIndex = 0
 }

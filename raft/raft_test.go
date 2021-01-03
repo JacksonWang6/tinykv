@@ -1212,6 +1212,8 @@ func TestCommitAfterRemoveNode3A(t *testing.T) {
 		t.Fatalf("expected ents[1] to be EntryType_EntryConfChange, got %v", ents[1])
 	}
 
+	// 我终于知道这个测试在干嘛了, 就是EntryType_EntryConfChange提交了之后, 集群的大多数节点的要求就变啦, 我们就需要重新看一些日志
+	// 是否满足可以提交的要求了.
 	// Apply the config change. This reduces quorum requirements so the
 	// pending command can now commit.
 	r.removeNode(2)
