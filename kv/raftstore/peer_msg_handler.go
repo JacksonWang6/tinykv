@@ -185,10 +185,10 @@ func (d *peerMsgHandler) processRequest (entry *pb.Entry, kvWB *engine_util.Writ
 		if command.CmdType == raft_cmdpb.CmdType_Put || command.CmdType == raft_cmdpb.CmdType_Delete {
 			switch command.CmdType {
 			case raft_cmdpb.CmdType_Put:
-				log.Infof("[%v] 正在执行SetCF: cf: %v key: %v, value: %v", d.Tag, command.Put.Cf, command.Put.Key, command.Put.Value)
+				log.Infof("[%v] 正在执行SetCF: cf: %v key: %v, value: %v", d.Tag, command.Put.Cf, string(command.Put.Key), string(command.Put.Value))
 				kvWB.SetCF(command.Put.Cf, command.Put.Key, command.Put.Value)
 			case raft_cmdpb.CmdType_Delete:
-				log.Infof("[%v] 正在执行DeleteCF: key: %v", d.Tag, command.Delete.Key)
+				log.Infof("[%v] 正在执行DeleteCF: key: %v", d.Tag, string(command.Delete.Key))
 				kvWB.DeleteCF(command.Delete.Cf, command.Delete.Key)
 			}
 			// 发现了一个神奇的bug, scan的时候want与got之间有时候就差最后一个key的值,但是我看日志里面明明写入了啊
@@ -210,11 +210,11 @@ func (d *peerMsgHandler) processRequest (entry *pb.Entry, kvWB *engine_util.Writ
 			value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, command.Get.Cf, command.Get.Key)
 			if err != nil {
 				log.Infof("[%v] Get操作失败,kvDB当中不存在 cf: %v key: %v",
-					d.Tag, command.Get.Cf, command.Get.Key)
+					d.Tag, string(command.Get.Cf), string(command.Get.Key))
 				p.cb.Done(ErrResp(err))
 				return
 			}
-			log.Infof("[%v] Get操作成功, key: %v, value: %v", d.Tag, command.Get.Key, value)
+			log.Infof("[%v] Get操作成功, key: %v, value: %v", d.Tag, string(command.Get.Key), string(value))
 			response = &raft_cmdpb.Response{
 				CmdType:              raft_cmdpb.CmdType_Get,
 				Get:                  &raft_cmdpb.GetResponse{
@@ -422,6 +422,9 @@ func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, kvWB *engine_util.
 				Version:              region.RegionEpoch.Version,
 			}
 			for i, peer := range region.Peers {
+				if i >= len(splitCmd.NewPeerIds) {
+					break
+				}
 				newRegion.Peers = append(newRegion.Peers, &metapb.Peer{
 					Id:                   splitCmd.NewPeerIds[i],
 					StoreId:              peer.GetStoreId(),
@@ -654,7 +657,7 @@ func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb 
 		// is applied, so you need to consider how to ignore the duplicate commands of same conf change.
 		// 如果PendingConfIndex的值大于 d.peerStorage.AppliedIndex(),那么说明存在还未被应用的confchang指令。直接返回
 		pendingConfIndex := d.RaftGroup.Raft.PendingConfIndex
-		if pendingConfIndex >= d.peerStorage.AppliedIndex() {
+		if pendingConfIndex > d.peerStorage.AppliedIndex() {
 			// 当前还有conf change并且这个conf change还没有被应用, 那么忽略后面的
 			log.Infof("当前conf change还没有被应用")
 			cb.Done(ErrResp(errors.New("error")))
@@ -999,6 +1002,7 @@ func (d *peerMsgHandler) destroyPeer() {
 	d.ctx.router.close(regionID)
 	d.stopped = true
 	if isInitialized && meta.regionRanges.Delete(&regionItem{region: d.Region()}) == nil {
+		log.Infof("isInitialized: %v", isInitialized)
 		panic(d.Tag + " meta corruption detected")
 	}
 	if _, ok := meta.regions[regionID]; !ok {

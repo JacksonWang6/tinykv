@@ -283,7 +283,7 @@ func (c *Cluster) GetRegion(key []byte) *metapb.Region {
 		// retry to get the region again.
 		SleepMS(20)
 	}
-	panic(fmt.Sprintf("find no region for %s", hex.EncodeToString(key)))
+	panic(fmt.Sprintf("find no region for %s, %v", hex.EncodeToString(key), string(key)))
 }
 
 func (c *Cluster) GetRandomRegion() *metapb.Region {
@@ -385,9 +385,9 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 		}
 		region := resp.Responses[0].GetSnap().Region
 		iter := raft_storage.NewRegionReader(txn, *region).IterCF(engine_util.CfDefault)
-		log.Infof("outer*** traceback: key: %v endkey: %v, region.endKey: %v", hex.EncodeToString(key), hex.EncodeToString(end), hex.EncodeToString(region.EndKey))
+//		log.Infof("outer*** traceback: key: %v endkey: %v, region.endKey: %v", hex.EncodeToString(key), hex.EncodeToString(end), hex.EncodeToString(region.EndKey))
 		for iter.Seek(key); iter.Valid(); iter.Next() {
-			log.Infof("inner***: iter.Item().Key() %v end %v", hex.EncodeToString(iter.Item().Key()), hex.EncodeToString(end))
+//			log.Infof("inner***: iter.Item().Key() %v end %v", hex.EncodeToString(iter.Item().Key()), hex.EncodeToString(end))
 			if engine_util.ExceedEndKey(iter.Item().Key(), end) {
 				break
 			}
@@ -396,7 +396,7 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 				panic(err)
 			}
 			values = append(values, value)
-			log.Infof("debug: value: %v", string(value))
+//			log.Infof("debug: value: %v", string(value))
 		}
 		iter.Close()
 

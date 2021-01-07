@@ -1,11 +1,9 @@
 package raft_storage
 
 import (
-	"encoding/hex"
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
-	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 )
 
@@ -59,7 +57,7 @@ func (it *RegionIterator) Item() engine_util.DBItem {
 }
 
 func (it *RegionIterator) Valid() bool {
-	log.Infof("valid: %v", hex.EncodeToString(it.region.EndKey))
+//	log.Infof("valid: %v", hex.EncodeToString(it.region.EndKey))
 	if !it.iter.Valid() || engine_util.ExceedEndKey(it.iter.Item().Key(), it.region.EndKey) {
 		return false
 	}
