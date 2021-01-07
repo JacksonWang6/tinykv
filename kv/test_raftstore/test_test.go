@@ -242,11 +242,11 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 					values := cluster.Scan([]byte(start), []byte(end))
 					v := string(bytes.Join(values, []byte("")))
 					if v != last {
-						//log.Infof("%d: client scan %v-%v\n", cli, start, end)
+						log.Infof("%d: client scan %v-%v\n", cli, start, end)
 						log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
 					} else {
-						//log.Infof("%d: client scan %v-%v\n", cli, start, end)
-						//log.Infof("get correct value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
+						log.Infof("%d: client scan %v-%v\n", cli, start, end)
+						log.Infof("get correct value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
 					}
 				}
 			}
@@ -693,6 +693,7 @@ func TestOneSplit3B(t *testing.T) {
 	left := cluster.GetRegion([]byte("k1"))
 	right := cluster.GetRegion([]byte("k2"))
 
+	log.Infof("left %v right %v", left.GetId(), right.GetId())
 	assert.NotEqual(t, left.GetId(), right.GetId())
 	assert.True(t, bytes.Equal(region.GetStartKey(), left.GetStartKey()))
 	assert.True(t, bytes.Equal(left.GetEndKey(), right.GetStartKey()))

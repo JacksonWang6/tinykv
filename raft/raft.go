@@ -245,7 +245,9 @@ func (r *Raft) sendSnapShot(to uint64) {
 		log.Infof("[%d] snapshot err", r.id)
 		// 真的是奇怪,ErrSnapshotTemporarilyUnavailable这个错误居然会运行到这里然后panic? 不应该在上面那个if那里return吗
 		// fix bug: it is not raft.ErrSnapshotTemporarilyUnavailable, it is just ErrSnapshotTemporarilyUnavailable
-		panic(err)
+//		panic(err)
+		// 这里还可能报错连续请求snap次数太多, 暂时直接返回
+		return
 	}
 	msg := pb.Message{
 		MsgType:              pb.MessageType_MsgSnapshot,
@@ -452,6 +454,12 @@ func (r *Raft) becomeLeader() {
 	// 每当成为Leader之后都会更新next和index
 	prevLogIndex := r.RaftLog.LastIndex()
 	for _, peer := range r.peers {
+		if peer == r.id {
+			// 按照测试用例 TestProgressLeader2AB, 我们需要在这里更新leader 的match与next
+			r.Prs[peer].Match = prevLogIndex+1
+			r.Prs[peer].Next = prevLogIndex+2
+			continue
+		}
 		r.Prs[peer].Next = prevLogIndex+1
 		r.Prs[peer].Match = 0	// 已经匹配的日志的index,初始化时不知道匹配到哪里, 赋值为0
 	}
@@ -462,10 +470,6 @@ func (r *Raft) becomeLeader() {
 		Index:                prevLogIndex+1,
 		Data: 				  nil,
 	})
-
-	// 按照测试用例 TestProgressLeader2AB, 我们需要在这里更新leader 的match与next
-	r.Prs[r.id].Match = r.RaftLog.LastIndex()
-	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
 
 	// 立即发送append包, 不然会导致添加这条新的日志之后,2aa的一些测试点挂掉
 	// 这里广播包的时候没有考虑只有一台机器的情况, TestLeaderAcknowledgeCommit2AB这个点挂掉了
@@ -659,7 +663,7 @@ func (r *Raft) updateCommit() {
 	// 成立,那么令 commitIndex 等于这个 N (5.3 和 5.4 节)
 	sortArr := make([]int, 0)
 	for _, peer := range r.peers {
-		DPrintf("sort addr: %d", r.Prs[peer].Match)
+		// DPrintf("sort addr: %d", r.Prs[peer].Match)
 		sortArr = append(sortArr, int(r.Prs[peer].Match))
 	}
 	sort.Ints(sortArr)
@@ -711,7 +715,7 @@ func (r *Raft) handleAppendEntriesResponse (m pb.Message) {
 		// 否则说明是日志被拒绝
 		// 失败是因为prevLogIndex 位置处的日志条目的任期号和 prevLogTerm 不匹配
 		// 按照论文里面说的, 如果因为日志不一致而失败,减少 nextIndex 重试
-		r.Prs[m.From].Next--
+		r.Prs[m.From].Next = m.Index+1
 		// 然后重发, 按照测试TestLeaderSyncFollowerLog2AB的逻辑应该是需要立即重发
 		r.sendAppend(m.From)
 	} else {
@@ -751,6 +755,10 @@ func (r *Raft) checkQualification(id uint64) (bool, error) {
 // 完了之后我们还得继续执行MessageType_MsgTimeoutNow的逻辑,转换身份
 // 解决办法,利用raft结构体的leadTransferee字段标记一下
 func (r *Raft) handleTransfer(m pb.Message) {
+	if r.id == m.From {
+		// 自己就是leader, 让位给自己的事情大可不必
+		return
+	}
 	valid, err := r.checkQualification(m.From)
 	if err != nil {
 		log.Infof("LeaderTransferToNonExistingNode")
@@ -788,9 +796,11 @@ func (r *Raft) appendEntry(m pb.Message) {
 		entry.Term = r.Term
 		if entry.EntryType == pb.EntryType_EntryConfChange {
 			if r.PendingConfIndex > r.RaftLog.applied {
-				entry.EntryType = pb.EntryType_EntryNormal
-				entry.Data = nil
+				// 当前raft的pendingconf 还没有被应用,那么忽略这个entry
+				log.Infof("当前raft的pendingconf 还没有被应用,那么忽略这个entry")
+				return
 			} else {
+				// 否则更新r.PendingConfIndex
 				r.PendingConfIndex = entry.Index
 			}
 		}
@@ -812,7 +822,7 @@ func (r *Raft) Step(m pb.Message) error {
 	//if m.MsgType == pb.MessageType_MsgSnapshot {
 	//	log.Infof("[%d] 收到了 snapshot的install请求", r.id)
 	//}
-	if r.Prs[r.id] == nil {
+	if r.Prs[r.id] == nil && m.MsgType == pb.MessageType_MsgTimeoutNow {
 		log.Infof("[%d] has been removed", r.id)
 		return nil
 	}
@@ -820,6 +830,10 @@ func (r *Raft) Step(m pb.Message) error {
 	case StateFollower:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
+			// 当存在未被应用的confchange时,拒绝MessageType_MsgHup操作。
+			if r.PendingConfIndex > r.RaftLog.applied {
+				return nil
+			}
 			r.becomeCandidate()
 			r.launchVote()
 		case pb.MessageType_MsgAppend:
@@ -830,7 +844,6 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgRequestVote:
 			r.handlerVote(m)
 		case pb.MessageType_MsgRequestVoteResponse:
-			r.handleVoteResponse(m)
 		case pb.MessageType_MsgSnapshot:
 			r.handleSnapshot(m)
 		case pb.MessageType_MsgTimeoutNow:
@@ -849,6 +862,10 @@ func (r *Raft) Step(m pb.Message) error {
 	case StateCandidate:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
+			// 当存在未被应用的confchange时,拒绝MessageType_MsgHup操作。
+			if r.PendingConfIndex > r.RaftLog.applied {
+				return nil
+			}
 			r.becomeCandidate()
 			r.launchVote()
 		case pb.MessageType_MsgAppend:
@@ -924,13 +941,26 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if prevLogIndex < m.Index {
 		DPrintf("[%d] 日志没有那么长,匹配不了", r.id)
 		// 没有与之相匹配的日志条目, 返回, 让leader减小next
+		msg.Index = prevLogIndex
 		r.msgs = append(r.msgs, msg)
 		return
 	}
 	// fix bug: 这里比较的时候比的是m.Index这个下标的任期号, 我已开始是与最后一个任期号作比较的
 	prevLogTerm, _ := r.RaftLog.Term(m.Index)
 	if prevLogTerm != m.LogTerm {
+		// 由于遇到了一个bug, 连续生成snap失败5次, 我以为是我没有实现快速回退导致的, 但是后来发现是其他原因
+		l := r.RaftLog
 		// 对应处的日志的任期号不匹配,那么leader也得减小next, 这样是为了之后可以把不匹配的部分覆盖删除掉, 日志以leader为准
+		index := min(m.Index, l.LastIndex())
+		for index > l.committed {
+			term, err := l.Term(index)
+			if err != nil || term != prevLogTerm {
+				break
+			}
+			index--
+		}
+		msg.Index = index
+		log.Infof("index %v, prevLogindex %v", index, prevLogIndex)
 		r.msgs = append(r.msgs, msg)
 		return
 	}
@@ -1060,10 +1090,11 @@ func (r *Raft) restore(s pb.Snapshot) bool {
 	if s.Metadata.Index <= r.RaftLog.committed {
 		// 如果现存的⽇志条⽬与快照中最后包含的⽇志条⽬具有相同的索引值和任期号，则保留其后的⽇志 条⽬并进⾏回复
 		// 出现这种情况说明快照里面的东西这台机器都存了
-		if r.RaftLog.entries[0].Index <= s.Metadata.Index {
-			// 仅保留其后的⽇志
-			r.RaftLog.entries = r.RaftLog.entries[s.Metadata.Index-r.RaftLog.entries[0].Index+1:]
-		}
+		// bug: panic: runtime error: index out of range [0] with length 0
+		//if r.RaftLog.entries[0].Index <= s.Metadata.Index {
+		//	// 仅保留其后的⽇志
+		//	r.RaftLog.entries = r.RaftLog.entries[s.Metadata.Index-r.RaftLog.entries[0].Index+1:]
+		//}
 		return false
 	}
 	// 保存快照⽂件，丢弃具有较⼩索引的任何现有或部分快照
@@ -1094,6 +1125,7 @@ func (r *Raft) restore(s pb.Snapshot) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	log.Infof("[%d] addNode %v", r.id, id)
 	flag := false
 	for _, peer := range r.peers {
 		if peer == id {
@@ -1105,7 +1137,8 @@ func (r *Raft) addNode(id uint64) {
 		r.peers = append(r.peers, id)
 		r.Prs[id] = &Progress{
 			Match: 0,
-			Next:  r.RaftLog.LastIndex()+1,
+			// fix bug: 一个新加入的节点的初始logindex是0, 那么下一条要发给他的就是1
+			Next:  1,
 		}
 	}
 	r.PendingConfIndex = 0
@@ -1113,6 +1146,7 @@ func (r *Raft) addNode(id uint64) {
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
+	log.Infof("[%d] remove %v", r.id, id)
 	// Your Code Here (3A).
 	for index, peer := range r.peers {
 		if peer == id {

@@ -361,50 +361,61 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	ps.snapState.StateType = snap.SnapState_Applying
-	// send runner.RegionTaskApply task to region worker through PeerStorage.regionSched
-	// and wait until region worker finish.
-	notify := make(chan bool, 1)
-	// fix bug: 这里掉了一个&, 导致了stop集群时卡死了
-	ps.regionSched <- &runner.RegionTaskApply{
-		RegionId: snapData.Region.Id,
-		Notifier: notify,
-		SnapMeta: snapshot.Metadata,
-		StartKey: snapData.Region.GetStartKey(),
-		EndKey:   snapData.Region.GetEndKey(),
-	}
-	// wait until region worker finish
-	<-notify
-	log.Infof("regionSched finished")
-	ps.snapState.StateType = snap.SnapState_Relax
-
-	// call ps.clearMeta and ps.clearExtraData to delete stale data
-	if ps.isInitialized() {
-		err := ps.clearMeta(kvWB, raftWB)
-		if err != nil {
-			panic(err)
+	var applySnapResult ApplySnapResult
+	if snapData.Region.RegionEpoch.ConfVer >= ps.region.RegionEpoch.ConfVer &&
+		snapData.Region.RegionEpoch.Version >= ps.region.RegionEpoch.Version {
+		ps.snapState.StateType = snap.SnapState_Applying
+		// call ps.clearMeta and ps.clearExtraData to delete stale data
+		if ps.isInitialized() {
+			err := ps.clearMeta(kvWB, raftWB)
+			if err != nil {
+				panic(err)
+			}
+			kvWB.WriteToDB(ps.Engines.Kv)
+			raftWB.WriteToDB(ps.Engines.Raft)
+			kvWB.Reset()
+			raftWB.Reset()
+			ps.clearExtraData(snapData.Region)
 		}
-		ps.clearExtraData(snapData.Region)
-	}
 
-	// RaftLocalState
-	ps.raftState.LastIndex = snapshot.Metadata.Index
-	ps.raftState.LastTerm = snapshot.Metadata.Term
-	// RaftApplyState
-	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
-	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
-	log.Infof("更新了 TruncatedState.Index: %d", ps.applyState.TruncatedState.Index)
-	ps.applyState.AppliedIndex = snapshot.Metadata.Index
-	// don’t forget to persist these states to kvdb and raftdb, raftdb will setmeta at outer function
-	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState)
+		// RaftLocalState
+		ps.raftState.LastIndex = snapshot.Metadata.Index
+		ps.raftState.LastTerm = snapshot.Metadata.Term
+		log.Infof("snapshot.Metadata.Index: %v", snapshot.Metadata.Index)
+		// RaftApplyState
+		ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+		ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+		log.Infof("更新了 TruncatedState.Index: %d", ps.applyState.TruncatedState.Index)
+		ps.applyState.AppliedIndex = snapshot.Metadata.Index
 
-	applySnapResult := ApplySnapResult{
-		PrevRegion: ps.region,
-		Region:     snapData.Region,
+
+		// fix bug: 要先更新状态之后再来执行RegionTask
+		// send runner.RegionTaskApply task to region worker through PeerStorage.regionSched
+		// and wait until region worker finish.
+		notify := make(chan bool, 1)
+		// fix bug: 这里掉了一个&, 导致了stop集群时卡死了
+		ps.regionSched <- &runner.RegionTaskApply{
+			RegionId: snapData.Region.Id,
+			Notifier: notify,
+			SnapMeta: snapshot.Metadata,
+			StartKey: snapData.Region.GetStartKey(),
+			EndKey:   snapData.Region.GetEndKey(),
+		}
+		// wait until region worker finish
+		<-notify
+		log.Infof("regionSched finished")
+
+		applySnapResult = ApplySnapResult{
+			PrevRegion: ps.region,
+			Region:     snapData.Region,
+		}
+
+		// don’t forget to persist these states to kvdb and raftdb, raftdb will setmeta at outer function
+		kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState)
+		// update region
+		ps.SetRegion(snapData.Region)
+		meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
 	}
-	// update region
-	ps.SetRegion(snapData.Region)
-	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
 	return &applySnapResult, nil
 }
 
@@ -459,6 +470,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// save it to raftdb, because raftdb stores raft log and RaftLocalState
 	// and RaftLocalState Used to store HardState of the current Raft and the last Log Index.
 	raftWB.WriteToDB(ps.Engines.Raft)
+//	log.Infof("raftstate.index: %v", ps.raftState.LastIndex)
 	// 这里目前不太清楚返回的applySnapResult怎样赋值
 	return applySnapResult, nil
 }

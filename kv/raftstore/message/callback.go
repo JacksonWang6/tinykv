@@ -20,7 +20,7 @@ func (cb *Callback) Done(resp *raft_cmdpb.RaftCmdResponse) {
 		return
 	}
 	if resp != nil {
-		log.Infof("resp is not nil: %v", resp)
+//		log.Infof("resp is not nil: %v", resp)
 		cb.Resp = resp
 	}
 	cb.done <- struct{}{}

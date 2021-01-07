@@ -108,6 +108,7 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 	stateKey := meta.RegionStateKey(regionID)
 	localState := new(rspb.RegionLocalState)
 	err := engine_util.GetMeta(d.ctx.engine.Kv, stateKey, localState)
+//	log.Infof("localState: %v", localState)
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
 			return false, nil
@@ -151,11 +152,12 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 
 func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	regionID := msg.RegionId
+	// peer not found
 	if err := d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeRaftMessage, Data: msg}); err == nil {
 		return nil
 	}
-	log.Debugf("handle raft message. from_peer:%d, to_peer:%d, store:%d, region:%d, msg:%+v",
-		msg.FromPeer.Id, msg.ToPeer.Id, d.storeState.id, regionID, msg.Message)
+	log.Infof("msg region epoch: %v handle raft message. from_peer:%d, to_peer:%d, store:%d, region:%d, msg:%+v",
+		msg.RegionEpoch, msg.FromPeer.Id, msg.ToPeer.Id, d.storeState.id, regionID, msg.Message)
 	if msg.ToPeer.StoreId != d.ctx.store.Id {
 		log.Warnf("store not match, ignore it. store_id:%d, to_store_id:%d, region_id:%d",
 			d.ctx.store.Id, msg.ToPeer.StoreId, regionID)

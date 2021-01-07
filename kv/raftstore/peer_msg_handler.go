@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"encoding/hex"
 	"fmt"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
@@ -55,9 +56,18 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.RaftGroup.HasReady() {
 		rd := d.RaftGroup.Ready()
 		// saveToStorage(rd.State, rd.Entries, rd.Snapshot)
-		_, err := d.peerStorage.SaveReadyState(&rd)
+		applySnapResult, err := d.peerStorage.SaveReadyState(&rd)
 		if err != nil {
 			panic(err)
+		}
+		if applySnapResult != nil {
+			// fix panic: find no region
+			d.peerStorage.SetRegion(applySnapResult.Region)
+			d.ctx.storeMeta.Lock()
+			d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapResult.PrevRegion})
+			d.ctx.storeMeta.setRegion(applySnapResult.Region, d.peer)
+			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapResult.Region})
+			d.ctx.storeMeta.Unlock()
 		}
 		// send(rd.Messages)
 		// Transport 对象，用来让 Peer 发送 message, 这个msgs就是Raft信箱中的msgs, 最开始在Ready函数里面还忘记了给这个赋值
@@ -74,6 +84,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			kvWB := new(engine_util.WriteBatch)
 			for _, entry := range rd.CommittedEntries {
 				d.process(&entry, kvWB)
+				// 这里的判断必不可少, 不然会导致destory之后又写入了applystate的信息, 导致newpeer时比较raftlogindex
+				// 与applyindex时出现大问题
+				if d.stopped {
+					return
+				}
 			}
 			// Do not forget to update and persist the apply state when applying the log entries.
 			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
@@ -86,6 +101,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			if err != nil {
 				panic(err)
 			}
+			log.Infof("[%v] term: %v 写入kvDB成功", d.Tag, d.Term())
 		}
 		// s.Node.Advance(rd)
 		// 更新状态机的状态
@@ -122,29 +138,132 @@ func (d *peerMsgHandler) getProposal (index, term uint64) proposal {
 
 // 处理那四种普通请求的函数
 func (d *peerMsgHandler) processRequest (entry *pb.Entry, kvWB *engine_util.WriteBatch, cmd *raft_cmdpb.RaftCmdRequest,) {
-	command := cmd.Requests[0]
-	log.Infof("[%v] 解析出来的命令: %v", d.Tag, command)
-	// 如果是修改的操作,那么我们需要将修改后的状态应用到状态机里面
-	// You can regard kvdb as the state machine mentioned in Raft paper
-	if command.CmdType == raft_cmdpb.CmdType_Put || command.CmdType == raft_cmdpb.CmdType_Delete {
+	p := d.getProposal(entry.Index, entry.Term)
+	// 如果在 Applied Index + 1 到 Last Index 之间的 Proposal 有修改 Region Epoch 的操作，
+	// 新 Proposal 就有可能会在应用的时候被跳过。
+	// 所以我们在process之前还需要再检查一遍
+	for _, request := range cmd.Requests {
+		key := d.getKey(request)
+		if key != nil {
+			err := util.CheckKeyInRegion(key, d.Region())
+			if err != nil {
+				if p.cb != nil {
+					if p.term == entry.Term {
+						p.cb.Done(ErrResp(err))
+					} else {
+						NotifyStaleReq(p.term, p.cb)
+					}
+				}
+				return
+			}
+		}
+	}
+	// 非 Admin Request， Proposal 中的 version 与当前的不相等。
+	if cmd.Header.RegionEpoch.Version != d.Region().RegionEpoch.Version {
+		if p.cb != nil {
+			if p.term == entry.Term {
+				p.cb.Done(ErrResp(&util.ErrEpochNotMatch{}))
+			} else {
+				NotifyStaleReq(p.term, p.cb)
+			}
+		}
+		return
+	}
+	if len(cmd.Requests) == 0 {
+		return
+	}
+	responses := raft_cmdpb.RaftCmdResponse{
+		Header:               &raft_cmdpb.RaftResponseHeader{
+			CurrentTerm:          entry.Term,
+		},
+	}
+//	txn := false
+	for _, command := range cmd.Requests {
+		log.Infof("[%v] 解析出来的命令: %v", d.Tag, command)
+		// 如果是修改的操作,那么我们需要将修改后的状态应用到状态机里面
+		// You can regard kvdb as the state machine mentioned in Raft paper
+		if command.CmdType == raft_cmdpb.CmdType_Put || command.CmdType == raft_cmdpb.CmdType_Delete {
+			switch command.CmdType {
+			case raft_cmdpb.CmdType_Put:
+				log.Infof("[%v] 正在执行SetCF: cf: %v key: %v, value: %v", d.Tag, command.Put.Cf, command.Put.Key, command.Put.Value)
+				kvWB.SetCF(command.Put.Cf, command.Put.Key, command.Put.Value)
+			case raft_cmdpb.CmdType_Delete:
+				log.Infof("[%v] 正在执行DeleteCF: key: %v", d.Tag, command.Delete.Key)
+				kvWB.DeleteCF(command.Delete.Cf, command.Delete.Key)
+			}
+			// 发现了一个神奇的bug, scan的时候want与got之间有时候就差最后一个key的值,但是我看日志里面明明写入了啊
+			// 所以我干脆每次set之后都写入一次
+			kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			// 清空kvWB
+			kvWB.Reset()
+		}
+		var response *raft_cmdpb.Response
 		switch command.CmdType {
 		case raft_cmdpb.CmdType_Put:
-			log.Infof("[%v] 正在执行SetCF: cf: %v key: %v, value: %v", d.Tag, command.Put.Cf, command.Put.Key, command.Put.Value)
-			kvWB.SetCF(command.Put.Cf, command.Put.Key, command.Put.Value)
-		case raft_cmdpb.CmdType_Delete:
-			log.Infof("[%v] 正在执行DeleteCF: key: %v", d.Tag, command.Delete.Key)
-			kvWB.DeleteCF(command.Delete.Cf, command.Delete.Key)
+			// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
+			response = &raft_cmdpb.Response{
+						CmdType:              raft_cmdpb.CmdType_Put,
+						Put:                  &raft_cmdpb.PutResponse{},
+					}
+			responses.Responses = append(responses.Responses, response)
+		case raft_cmdpb.CmdType_Get:
+			value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, command.Get.Cf, command.Get.Key)
+			if err != nil {
+				log.Infof("[%v] Get操作失败,kvDB当中不存在 cf: %v key: %v",
+					d.Tag, command.Get.Cf, command.Get.Key)
+				p.cb.Done(ErrResp(err))
+				return
+			}
+			log.Infof("[%v] Get操作成功, key: %v, value: %v", d.Tag, command.Get.Key, value)
+			response = &raft_cmdpb.Response{
+				CmdType:              raft_cmdpb.CmdType_Get,
+				Get:                  &raft_cmdpb.GetResponse{
+					Value:                value,
+				},
+			}
+			responses.Responses = append(responses.Responses, response)
+		case  raft_cmdpb.CmdType_Delete:
+			// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
+			response = &raft_cmdpb.Response{
+				CmdType:              raft_cmdpb.CmdType_Delete,
+				Delete:               &raft_cmdpb.DeleteResponse{},
+			}
+			responses.Responses = append(responses.Responses, response)
+		case raft_cmdpb.CmdType_Snap:
+			// !!!!!! fix bug
+			// 这里必须得传一个深拷贝过去:
+			// 不然的话如果直接传一个指针过去那么当在scan的时候发生split region将会发生错误
+			// 因为跨region的scan它的逻辑是看当前region是否遍历完，遍历完之后更新key为endkey，
+			// 然后获取下一个连续的新region，但是这个时候发生了split就会导致当前region的endkey发生变化，
+			// 就会导致key更新出问题，这时key就会更新为splitKey的值, 然后就回到前面split的位置又scan了一遍
+			// 这个bug找了我整整一天啊!!!
+			var region metapb.Region
+			region.StartKey = d.Region().StartKey
+			region.EndKey = d.Region().EndKey
+			region.RegionEpoch = &metapb.RegionEpoch{
+				ConfVer:              d.Region().RegionEpoch.ConfVer,
+				Version:              d.Region().RegionEpoch.Version,
+			}
+			region.Id = d.Region().Id
+			for _, peer := range d.Region().Peers {
+				region.Peers = append(region.Peers, &metapb.Peer{
+					Id:                   peer.Id,
+					StoreId:              peer.StoreId,
+				})
+			}
+			response = &raft_cmdpb.Response{
+				CmdType:              raft_cmdpb.CmdType_Snap,
+				Snap:              	  &raft_cmdpb.SnapResponse{
+					Region:               &region,
+				},
+			}
+			responses.Responses = append(responses.Responses, response)
+			//txn = true
 		}
-		log.Infof("[%v] 写入kvDB", d.Tag)
-		// fix bug: 不应该在这里写入, 而且这里的清空貌似也存在bug, 得等到后面统一写入
-		//kvWB.WriteToDB(d.peerStorage.Engines.Kv)
-		//// 清空kvWB
-		//kvWB = new(engine_util.WriteBatch)
 	}
 	// Record the callback of the command when proposing, and return the callback after applying.
 	// 处理完毕之后,还需要看看是否执行回调函数
 	// returns the response by callback
-	p := d.getProposal(entry.Index, entry.Term)
 	if p.cb == nil {
 		return
 	}
@@ -153,65 +272,36 @@ func (d *peerMsgHandler) processRequest (entry *pb.Entry, kvWB *engine_util.Writ
 		NotifyStaleReq(p.term, p.cb)
 		return
 	}
-	log.Infof("[%v] 正在执行回调,返回response, command type: %v", d.Tag, command.CmdType)
+	//if txn {
+		p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+	//}
+	log.Infof("[%v] 正在执行回调,返回responses", d.Tag)
+	p.cb.Done(&responses)
+}
+
+func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, kvWB *engine_util.WriteBatch, cmd *raft_cmdpb.RaftCmdRequest) {
+	p := d.getProposal(entry.Index, entry.Term)
+	// check admin request
+	err := util.CheckRegionEpoch(cmd, d.Region(), true)
+	if err != nil {
+		log.Infof("CheckRegionEpoch err: %v", err)
+		if p.cb != nil {
+			if p.term == entry.Term {
+				p.cb.Done(ErrResp(err))
+			} else {
+				NotifyStaleReq(p.term, p.cb)
+			}
+		}
+	}
 	response := raft_cmdpb.RaftCmdResponse{
 		Header:               &raft_cmdpb.RaftResponseHeader{
 			CurrentTerm:          entry.Term,
 		},
 	}
-	switch command.CmdType {
-	case raft_cmdpb.CmdType_Put:
-		// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
-		response.Responses = []*raft_cmdpb.Response{
-			&raft_cmdpb.Response{
-				CmdType:              raft_cmdpb.CmdType_Put,
-				Put:                  &raft_cmdpb.PutResponse{},
-			},
-		}
-	case raft_cmdpb.CmdType_Get:
-		value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, command.Get.Cf, command.Get.Key)
-		if err != nil {
-			log.Infof("[%v] Get操作失败,kvDB当中不存在 cf: %v key: %v",
-				d.Tag, command.Get.Cf, command.Get.Key)
-			p.cb.Done(ErrResp(err))
-			return
-		}
-		log.Infof("[%v] Get操作成功, key: %v, value: %v", d.Tag, command.Get.Key, value)
-		response.Responses = []*raft_cmdpb.Response{
-			&raft_cmdpb.Response{
-				CmdType:              raft_cmdpb.CmdType_Get,
-				Get:                  &raft_cmdpb.GetResponse{
-					Value:                value,
-				},
-			},
-		}
-	case  raft_cmdpb.CmdType_Delete:
-		// 前面已经应用到状态机里面了,所以这里只用构造一个response就可以了
-		response.Responses = []*raft_cmdpb.Response{
-			&raft_cmdpb.Response{
-				CmdType:              raft_cmdpb.CmdType_Delete,
-				Delete:               &raft_cmdpb.DeleteResponse{},
-			},
-		}
-	case raft_cmdpb.CmdType_Snap:
-		response.Responses = []*raft_cmdpb.Response{
-			&raft_cmdpb.Response{
-				CmdType:              raft_cmdpb.CmdType_Snap,
-				Snap:              	  &raft_cmdpb.SnapResponse{
-					Region:               d.Region(),
-				},
-			},
-		}
-		p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-	}
-	p.cb.Done(&response)
-}
-
-func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, kvWB *engine_util.WriteBatch, cmd *raft_cmdpb.RaftCmdRequest) {
 	adminCommand := cmd.AdminRequest
 	switch adminCommand.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
-		log.Infof("[%v] 正在处理AdminCmdType_CompactLog命令: %v", d.Tag, adminCommand)
+		log.Infof("[%v] 正在 process AdminCmdType_CompactLog命令: %v", d.Tag, adminCommand.CompactLog)
 		// CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is
 		// in the RaftApplyState
 		compactLog, applyState := adminCommand.GetCompactLog(), d.peerStorage.applyState
@@ -225,10 +315,165 @@ func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, kvWB *engine_util.
 			// 发送一个raftLogGcTask到raftLogGCTaskSender，在另一个线程中对raftdb中的日志进行压缩
 			// firstIndex字段压根没使用,随便传一个东西好了
 			d.ScheduleCompactLog(0, applyState.TruncatedState.Index)
+			response.AdminResponse = &raft_cmdpb.AdminResponse{
+				CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+				CompactLog: &raft_cmdpb.CompactLogResponse{},
+			}
+		}
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		log.Infof("[%v] 正在 process AdminCmdType_ChangePeer: %v", d.Tag, adminCommand.ChangePeer)
+		// After the log is committed, change the RegionLocalState, including RegionEpoch and Peers in Region
+		region := d.Region()
+		// RegionEpoch’s conf_ver increases during ConfChange
+		changePeer := cmd.AdminRequest.ChangePeer.Peer
+		var msg pb.ConfChange
+		msg.Unmarshal(entry.Data)
+		switch msg.ChangeType {
+		case pb.ConfChangeType_AddNode:
+			if cmd.Header.RegionEpoch.ConfVer >= d.peerStorage.region.RegionEpoch.ConfVer {
+				found := false
+				for _, p := range region.Peers {
+					if p.Id == changePeer.Id && p.StoreId == changePeer.StoreId {
+						found = true
+						break
+					}
+				}
+				if !found {
+					// fix bug: 一定要先更新, 再WriteRegionState, 不然checksnap的时候会报confversion的错
+					// 如果不存在,那么添加进去
+					region.Peers = append(region.Peers, changePeer)
+					region.RegionEpoch.ConfVer = cmd.Header.RegionEpoch.ConfVer+1
+					log.Infof("[%v] RegionEpoch.ConfVer: %v", d.Tag, region.RegionEpoch.ConfVer)
+					// Do not forget to update the region state in storeMeta of GlobalContext
+					d.ctx.storeMeta.Lock()
+					d.ctx.storeMeta.setRegion(region, d.peer)
+					d.ctx.storeMeta.Unlock()
+					meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+					d.insertPeerCache(changePeer)
+				}
+			}
+		case pb.ConfChangeType_RemoveNode:
+			if cmd.Header.RegionEpoch.ConfVer >= d.peerStorage.region.RegionEpoch.ConfVer {
+				for index, peer := range region.Peers {
+					if peer.Id == msg.NodeId && peer.StoreId == changePeer.StoreId {
+						region.Peers = append(region.Peers[:index], region.Peers[index+1:]...)
+						region.RegionEpoch.ConfVer = cmd.Header.RegionEpoch.ConfVer+1
+						log.Infof("[%v] RegionEpoch.ConfVer: %v", d.Tag, region.RegionEpoch.ConfVer)
+						// Do not forget to update the region state in storeMeta of GlobalContext
+						d.ctx.storeMeta.Lock()
+						d.ctx.storeMeta.setRegion(region, d.peer)
+						d.ctx.storeMeta.Unlock()
+						meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+						d.removePeerCache(msg.NodeId)
+						break
+					}
+				}
+				if d.Meta.Id == changePeer.Id {
+					// 停机, 立刻返回
+					d.destroyPeer()
+					return
+				}
+			}
+		}
+		kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+		kvWB.Reset()
+		// Call ApplyConfChange() of raft.RawNode
+		d.RaftGroup.ApplyConfChange(msg)
+		response.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:              raft_cmdpb.AdminCmdType_ChangePeer,
+			ChangePeer:           &raft_cmdpb.ChangePeerResponse{
+				Region:               d.Region(),
+			},
+		}
+	case raft_cmdpb.AdminCmdType_Split:
+		splitCmd := adminCommand.Split
+		log.Infof("[%v] 正在 process AdminCmdType_Split: %v", d.Tag, splitCmd)
+		// 检查
+		// 首先检测split key是否在start key 和end key之间，不满足返回
+		err := util.CheckKeyInRegion(splitCmd.SplitKey, d.Region())
+		if err != nil {
+			log.Infof("splitkey not in region")
+			// 不在
+			if p.cb == nil {
+				return
+			}
+			if p.term != entry.Term {
+				log.Infof("[%v] ErrRespStaleCommand", d.Tag)
+				NotifyStaleReq(p.term, p.cb)
+				return
+			}
+			p.cb.Done(ErrResp(err))
+			return
+		}
+		log.Infof("run here")
+		var regions []*metapb.Region
+		if cmd.Header.RegionEpoch.Version >= d.peerStorage.region.RegionEpoch.Version {
+			// 创建新region 原region和新region key范围为start~split，split~end
+			// The corresponding Peer of this newly-created Region should be created by createPeer() and
+			// registered to the router.regions. And the region’s info should be inserted into
+			// regionRanges in ctx.StoreMeta.
+			log.Infof("run here")
+			region := d.Region()
+			newRegion := new(metapb.Region)
+			newRegion.Id = splitCmd.NewRegionId
+			region.RegionEpoch.Version++
+			newRegion.RegionEpoch = &metapb.RegionEpoch{
+				ConfVer:              region.RegionEpoch.ConfVer,
+				Version:              region.RegionEpoch.Version,
+			}
+			for i, peer := range region.Peers {
+				newRegion.Peers = append(newRegion.Peers, &metapb.Peer{
+					Id:                   splitCmd.NewPeerIds[i],
+					StoreId:              peer.GetStoreId(),
+				})
+			}
+			newRegion.StartKey = splitCmd.SplitKey
+			newRegion.EndKey = region.EndKey
+			region.EndKey = splitCmd.SplitKey
+			log.Infof("original: [%v, %v) new: [%v, %v)", hex.EncodeToString(region.StartKey),
+				hex.EncodeToString(region.EndKey), hex.EncodeToString(newRegion.StartKey), hex.EncodeToString(newRegion.EndKey))
+			newPeer, err := createPeer(d.ctx.store.Id, d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+			if err != nil {
+				panic(err)
+			}
+			d.ctx.router.register(newPeer)
+			for _, peer := range newRegion.Peers {
+				newPeer.insertPeerCache(peer)
+			}
+			d.ctx.storeMeta.Lock()
+			d.ctx.storeMeta.setRegion(region, d.peer)
+			d.ctx.storeMeta.setRegion(newRegion, newPeer)
+			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+			d.ctx.storeMeta.Unlock()
+			meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+			meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+			// 下面的这几步我也不知道为什么要这样做, 16级学长给的一份指导里面是这样说的qwq
+			// 设置SizeDiffHint为0, 设置ApproximateSize为0
+			// 如果是leader,则调用HeartbeatScheduler
+			// 对于新创建的region,调用createPeer,并调用insertPeerCache插入peer信息, 发送MsgTypeStart信息
+			d.SizeDiffHint = 0
+			d.ApproximateSize = nil
+			if d.IsLeader() {
+				// 如果是leader,则调用HeartbeatScheduler
+				d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+			}
+			newPeer.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+			d.ctx.router.send(newRegion.Id, message.Msg{
+				Type:     message.MsgTypeStart,
+				RegionID: newRegion.GetId(),
+			})
+			regions = append(regions, region)
+			regions = append(regions, newRegion)
+		}
+		response.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:              raft_cmdpb.AdminCmdType_Split,
+			Split:           	  &raft_cmdpb.SplitResponse{
+				Regions:              regions,
+			},
 		}
 	}
 	// 处理回应
-	p := d.getProposal(entry.Index, entry.Term)
 	if p.cb == nil {
 		return
 	}
@@ -237,6 +482,8 @@ func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, kvWB *engine_util.
 		NotifyStaleReq(p.term, p.cb)
 		return
 	}
+	log.Infof("[%v] 正在执行回调,返回response, command type: %v", d.Tag, adminCommand.CmdType)
+	p.cb.Done(&response)
 }
 
 // apply已经提交的日志
@@ -248,11 +495,26 @@ func (d *peerMsgHandler) process(entry *pb.Entry, kvWB *engine_util.WriteBatch) 
 	}
 	log.Infof("[%v] 正在process Entry: %v", d.Tag, entry)
 	message := &raft_cmdpb.RaftCmdRequest{}
-	err := message.Unmarshal(entry.Data)
-	if err != nil {
-		log.Infof("process Unmarshal error: %v", err)
-		return err
+	if entry.EntryType == pb.EntryType_EntryConfChange {
+		var confChange pb.ConfChange
+		err := confChange.Unmarshal(entry.Data)
+		if err != nil {
+			log.Infof("Unmarshal confChange error")
+			return err
+		}
+		err = message.Unmarshal(confChange.Context)
+		if err != nil {
+			log.Infof("Unmarshal confChange.Context error")
+			return err
+		}
+	} else {
+		err := message.Unmarshal(entry.Data)
+		if err != nil {
+			log.Infof("process Unmarshal error: %v", err)
+			return err
+		}
 	}
+	log.Infof("message: %v", message)
 	if message.AdminRequest != nil {
 		log.Infof("process admin")
 		d.processAdminRequest(entry, kvWB, message)
@@ -306,7 +568,7 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		leader := d.getPeerFromCache(leaderID)
 		// ErrNotLeader: the raft command is proposed on a follower. so use it to let client try other peers.
 		// 框架代码已经在这里帮我们实现好了,所以我们只用调用该函数,然后判断err是否为nil并返回err即可\
-		log.Infof("[%v] ErrNotLeader, leaderId: %v", d.Tag, leaderID)
+//		log.Infof("[%v] ErrNotLeader, leaderId: %v", d.Tag, leaderID)
 		return &util.ErrNotLeader{RegionId: regionID, Leader: leader}
 	}
 	// peer_id must be the same as peer's.
@@ -333,13 +595,10 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	//if msg.AdminRequest != nil {
-	//	log.Infof("这里收到了compact请求")
-	//}
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
-		log.Infof("[%v] err preProposeRaftCommand", d.Tag)
-		log.Infof("这个错误的提交为%v", msg)
+//		log.Infof("[%v] err preProposeRaftCommand", d.Tag)
+//		log.Infof("这个错误的提交为%v", msg)
 		cb.Done(ErrResp(err))
 		return
 	}
@@ -352,42 +611,122 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 }
 
-func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	admin := msg.AdminRequest
-	log.Infof("[%v] 正在处理AdminRequest: %v", d.Tag, admin)
-	if admin.CmdType == raft_cmdpb.AdminCmdType_CompactLog {
-		// bug here: 我终于知道为什么一直没有处理那个compact请求了, 因为这里propose请求的时候出现了错误
-		// request, err := admin.Marshal()
-		request, err := msg.Marshal()
-		log.Infof("[%v] 正在处理compact: %v", d.Tag, request)
-		if err != nil {
-			panic(err)
-		}
-		log.Infof("正在添加新的proposal, index: %v, term: %v", d.nextProposalIndex(), d.Term())
-		// 添加新的proposal
-		d.proposals = append(d.proposals, &proposal{
-			index: d.nextProposalIndex(),
-			term:  d.Term(),
-			cb:    cb,
-		})
-		d.RaftGroup.Propose(request)
-	}
-}
-
-func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-	// fix bug: 这里就是一条请求, 不是循环处理, 不然会出现解析错误的情况
-	// for _, request := range msg.Requests {
-	data, err := msg.Marshal()
-	if err != nil {
-		panic(err)
-	}
-	log.Infof("正在添加新的proposal, index: %v, term: %v", d.nextProposalIndex(), d.Term())
+func (d *peerMsgHandler) addProposal(cb *message.Callback) {
 	// 添加新的proposal
 	d.proposals = append(d.proposals, &proposal{
 		index: d.nextProposalIndex(),
 		term:  d.Term(),
 		cb:    cb,
 	})
+}
+
+func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	admin := msg.AdminRequest
+	log.Infof("[%v] 正在 propose AdminRequest: %v", d.Tag, admin)
+	switch admin.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		// bug here: 我终于知道为什么一直没有处理那个compact请求了, 因为这里propose请求的时候出现了错误
+		// request, err := admin.Marshal()
+		request, err := msg.Marshal()
+		log.Infof("[%v] 正在 propose compact: %v", d.Tag, admin)
+		if err != nil {
+			panic(err)
+		}
+		log.Infof("正在添加新的proposal, index: %v, term: %v", d.nextProposalIndex(), d.Term())
+		d.addProposal(cb)
+		d.RaftGroup.Propose(request)
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		//  just need to call the TransferLeader() method of RawNode instead of Propose() for
+		//  TransferLeader command
+		d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+		// 直接返回response
+		cb.Done(&raft_cmdpb.RaftCmdResponse{
+			Header:               &raft_cmdpb.RaftResponseHeader{
+				CurrentTerm:          d.Term(),
+			},
+			AdminResponse:        &raft_cmdpb.AdminResponse{
+				CmdType:              raft_cmdpb.AdminCmdType_TransferLeader,
+				TransferLeader:       &raft_cmdpb.TransferLeaderResponse{},
+			},
+		})
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		// Test code schedules the command of one conf change multiple times until the conf change
+		// is applied, so you need to consider how to ignore the duplicate commands of same conf change.
+		// 如果PendingConfIndex的值大于 d.peerStorage.AppliedIndex(),那么说明存在还未被应用的confchang指令。直接返回
+		pendingConfIndex := d.RaftGroup.Raft.PendingConfIndex
+		if pendingConfIndex >= d.peerStorage.AppliedIndex() {
+			// 当前还有conf change并且这个conf change还没有被应用, 那么忽略后面的
+			log.Infof("当前conf change还没有被应用")
+			cb.Done(ErrResp(errors.New("error")))
+			return
+		}
+		changePeer := msg.AdminRequest.ChangePeer
+		context, err := msg.Marshal()
+		if err != nil {
+			panic(err)
+		}
+		request := pb.ConfChange{
+			ChangeType:           changePeer.ChangeType,
+			NodeId:               changePeer.Peer.Id,
+			Context: 			  context,
+		}
+		log.Infof("正在添加新的proposal, index: %v, term: %v", d.nextProposalIndex(), d.Term())
+		d.addProposal(cb)
+		// Propose conf change admin command by ProposeConfChange
+		d.RaftGroup.ProposeConfChange(request)
+	case raft_cmdpb.AdminCmdType_Split:
+		err := util.CheckKeyInRegion(admin.Split.SplitKey, d.Region())
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		request, err := msg.Marshal()
+		log.Infof("[%v] 正在 propose Split: %v", d.Tag, admin)
+		if err != nil {
+			panic(err)
+		}
+		log.Infof("正在添加新的proposal, index: %v, term: %v", d.nextProposalIndex(), d.Term())
+		d.addProposal(cb)
+		d.RaftGroup.Propose(request)
+	}
+}
+
+func (d *peerMsgHandler) getKey (request *raft_cmdpb.Request) []byte {
+	switch request.CmdType {
+	case raft_cmdpb.CmdType_Get:
+		return request.Get.Key
+	case raft_cmdpb.CmdType_Delete:
+		return request.Delete.Key
+	case raft_cmdpb.CmdType_Put:
+		return request.Put.Key
+	default:
+		return nil
+	}
+}
+
+func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// 在这里需要判断key是否在region里面
+	for _, request := range msg.Requests {
+		key := d.getKey(request)
+		if key != nil {
+			err := util.CheckKeyInRegion(key, d.Region())
+			if err != nil {
+				cb.Done(ErrResp(err))
+				return
+			}
+		}
+	}
+
+	if len(msg.Requests) == 0 {
+		return
+	}
+
+	data, err := msg.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	log.Infof("正在添加新的proposal, index: %v, term: %v, cmd: %v", d.nextProposalIndex(), d.Term(), msg)
+	d.addProposal(cb)
 	// 向RaftGroup提交command
 	d.RaftGroup.Propose(data)
 }

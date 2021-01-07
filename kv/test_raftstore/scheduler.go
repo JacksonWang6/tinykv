@@ -3,6 +3,7 @@ package test_raftstore
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"sync"
 
 	"github.com/google/btree"
@@ -295,6 +296,7 @@ func (m *MockSchedulerClient) RegionHeartbeat(req *schedulerpb.RegionHeartbeatRe
 
 func (m *MockSchedulerClient) handleHeartbeatVersion(region *metapb.Region) error {
 	if engine_util.ExceedEndKey(region.GetStartKey(), region.GetEndKey()) {
+		log.Infof("start key %v end key %v", hex.EncodeToString(region.GetStartKey()), hex.EncodeToString(region.GetEndKey()))
 		panic("start key > end key")
 	}
 
@@ -361,7 +363,9 @@ func (m *MockSchedulerClient) handleHeartbeatConfVersion(region *metapb.Region) 
 			if regionPeerLen-searchRegionPeerLen != 1 {
 				panic("should only one conf change")
 			}
+//			log.Infof("=================================")
 			if len(GetDiffPeers(region, searchRegion)) != 1 {
+				// log.Infof("len(GetDiffPeers(region, searchRegion)) = %v", len(GetDiffPeers(region, searchRegion)))
 				panic("should only one different peer")
 			}
 			if len(GetDiffPeers(searchRegion, region)) != 0 {
@@ -495,6 +499,7 @@ func (m *MockSchedulerClient) removeRegionLocked(region *metapb.Region) {
 
 // Extra API for tests
 func (m *MockSchedulerClient) AddPeer(regionID uint64, peer *metapb.Peer) {
+	log.Infof("start add peer: regionId %v storeId %v peerId %v", regionID, peer.StoreId, peer.Id)
 	m.scheduleOperator(regionID, &Operator{
 		Type: OperatorTypeAddPeer,
 		Data: &OpAddPeer{
@@ -505,6 +510,7 @@ func (m *MockSchedulerClient) AddPeer(regionID uint64, peer *metapb.Peer) {
 }
 
 func (m *MockSchedulerClient) RemovePeer(regionID uint64, peer *metapb.Peer) {
+	log.Infof("start remove peer: regionId %v storeId %v peerId %v", regionID, peer.StoreId, peer.Id)
 	m.scheduleOperator(regionID, &Operator{
 		Type: OperatorTypeRemovePeer,
 		Data: &OpRemovePeer{
@@ -555,6 +561,7 @@ func GetDiffPeers(left *metapb.Region, right *metapb.Region) []*metapb.Peer {
 	peers := make([]*metapb.Peer, 0, 1)
 	for _, p := range left.GetPeers() {
 		if FindPeer(right, p.GetStoreId()) == nil {
+			// log.Infof("p.GetStoreId() = %v", p.GetStoreId())
 			peers = append(peers, p)
 		}
 	}
@@ -563,6 +570,7 @@ func GetDiffPeers(left *metapb.Region, right *metapb.Region) []*metapb.Peer {
 
 func FindPeer(region *metapb.Region, storeID uint64) *metapb.Peer {
 	for _, p := range region.GetPeers() {
+		// log.Infof("storeID: %v <==> p.GetStoreId(): %v", storeID, p.GetStoreId())
 		if p.GetStoreId() == storeID {
 			return p
 		}

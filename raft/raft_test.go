@@ -17,6 +17,7 @@ package raft
 import (
 	"bytes"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
 	"math/rand"
 	"reflect"
 	"testing"
@@ -56,6 +57,8 @@ func TestProgressLeader2AB(t *testing.T) {
 	propMsg := pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("foo")}}}
 	for i := 0; i < 5; i++ {
 		if pr := r.Prs[r.id]; pr.Match != uint64(i+1) || pr.Next != pr.Match+1 {
+			log.Infof("Iter %v", i)
+			t.Errorf("pr.Match %v, uint64(i+1): %v, pr.Next: %v", pr.Match, uint64(i+1), pr.Next)
 			t.Errorf("unexpected progress %v", pr)
 		}
 		if err := r.Step(propMsg); err != nil {

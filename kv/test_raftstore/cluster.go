@@ -224,7 +224,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 		resp, txn := c.CallCommand(request, 1*time.Second)
 		// log.Infof("run here")
 		if resp == nil {
-			log.Infof("CallCommandOnLeader resp is nil")
+//			log.Infof("CallCommandOnLeader resp is nil")
 			log.Debugf("can't call command %s on leader %d of region %d", request.String(), leader.GetId(), regionID)
 			newLeader := c.LeaderOfRegion(regionID)
 			if leader == newLeader {
@@ -250,7 +250,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 					leader = err.GetNotLeader().Leader
 				} else {
 					leader = c.LeaderOfRegion(regionID)
-					log.Infof("run here: leader: %v, region: %v", leader, regionID)
+//					log.Infof("run here: leader: %v, region: %v", leader, regionID)
 				}
 				continue
 			}
@@ -370,6 +370,8 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 	req := NewSnapCmd()
 	values := make([][]byte, 0)
 	key := start
+	// 我想我知道了scan在面对跨region的时候是怎样操作的了,首先根据startkey找到第一个region,然后遍历,指导unvilid
+	// 然后将key赋值为endkey, 也就是下一个region的startkey, 然后接着遍历, 以此类推
 	for (len(end) != 0 && bytes.Compare(key, end) < 0) || (len(key) == 0 && len(end) == 0) {
 		resp, txn := c.Request(key, []*raft_cmdpb.Request{req}, 5*time.Second)
 		if resp.Header.Error != nil {
@@ -383,9 +385,9 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 		}
 		region := resp.Responses[0].GetSnap().Region
 		iter := raft_storage.NewRegionReader(txn, *region).IterCF(engine_util.CfDefault)
-		// log.Infof("outer***")
+		log.Infof("outer*** traceback: key: %v endkey: %v, region.endKey: %v", hex.EncodeToString(key), hex.EncodeToString(end), hex.EncodeToString(region.EndKey))
 		for iter.Seek(key); iter.Valid(); iter.Next() {
-			// log.Infof("inner***: iter.Item().Key() %v end %v", iter.Item().Key(), end)
+			log.Infof("inner***: iter.Item().Key() %v end %v", hex.EncodeToString(iter.Item().Key()), hex.EncodeToString(end))
 			if engine_util.ExceedEndKey(iter.Item().Key(), end) {
 				break
 			}
@@ -394,11 +396,12 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 				panic(err)
 			}
 			values = append(values, value)
-			// log.Infof("debug: value: %v, values: %v", value, values)
+			log.Infof("debug: value: %v", string(value))
 		}
 		iter.Close()
 
 		key = region.EndKey
+		log.Infof("*** change key to endkey: %v, region.EndKey %v", hex.EncodeToString(key), hex.EncodeToString(region.EndKey))
 		if len(key) == 0 {
 			break
 		}
@@ -447,6 +450,7 @@ func (c *Cluster) MustRemovePeer(regionID uint64, peer *metapb.Peer) {
 
 func (c *Cluster) MustHavePeer(regionID uint64, peer *metapb.Peer) {
 	for i := 0; i < 500; i++ {
+		log.Infof("Iter %d", i)
 		region, _, err := c.schedulerClient.GetRegionByID(context.TODO(), regionID)
 		if err != nil {
 			panic(err)
