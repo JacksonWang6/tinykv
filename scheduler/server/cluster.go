@@ -276,11 +276,94 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 	return nil
 }
 
+// 判断是否可信
+func (c *RaftCluster) isCredible(region *core.RegionInfo) bool {
+	// Check whether there is a region with the same Id in local storage
+	hbRegionEpoch := region.GetRegionEpoch()
+	ok := c.core.GetRegion(region.GetID())
+	if ok == nil {
+		overlaps := c.core.GetOverlaps(region)
+		for _, region := range overlaps {
+			regionEpoch := region.GetRegionEpoch()
+			if hbRegionEpoch.GetConfVer() < regionEpoch.GetConfVer() ||
+				hbRegionEpoch.GetVersion() < regionEpoch.GetVersion() {
+				return false
+			}
+		}
+	} else {
+		// 首先比较version, 如果一样那么在比较conf_ver
+		regionEpoch := ok.GetRegionEpoch()
+		if hbRegionEpoch.GetVersion() < regionEpoch.GetVersion() ||
+			hbRegionEpoch.GetConfVer() < regionEpoch.GetConfVer() {
+			return false
+		}
+	}
+	return true
+}
+
+// 判断是否需要更新, 这个其实不重要, 因为冗余更新不会影响正确性
+/*
+	If the new one’s version or conf_ver is greater than the original one, it cannot be skipped
+	If the leader changed, it cannot be skipped
+	If the new one or original one has pending peer, it cannot be skipped
+	If the ApproximateSize changed, it cannot be skipped
+	...
+*/
+func (c *RaftCluster) isUpdate(region *core.RegionInfo) bool {
+	hbRegionEpoch := region.GetRegionEpoch()
+	ok := c.core.GetRegion(region.GetID())
+	var regionEpoch *metapb.RegionEpoch
+	if ok != nil {
+		regionEpoch = ok.GetRegionEpoch()
+	} else {
+		// it ok == nil, then it absolutely changed, so cannot be skipped
+		return true
+	}
+	// 	If the new one’s version or conf_ver is greater than the original one, it cannot be skipped
+	if hbRegionEpoch.GetVersion() > regionEpoch.GetVersion() ||
+		hbRegionEpoch.GetConfVer() > regionEpoch.GetConfVer() {
+		return true
+	}
+	// 	If the leader changed, it cannot be skipped
+	if region.GetLeader().GetId() != ok.GetLeader().GetId() {
+		return true
+	}
+	// 	If the new one or original one has pending peer, it cannot be skipped
+	if len(ok.GetPendingPeers()) > 0 || len(region.GetPendingPeers()) > 0 {
+		return true
+	}
+	// 	If the ApproximateSize changed, it cannot be skipped
+	if region.GetApproximateSize() != ok.GetApproximateSize() {
+		return true
+	}
+	// If the regions's peers changed, it also cannot be skipped
+	if len(region.GetPeers()) != len(ok.GetPeers()) {
+		return true
+	}
+	return false
+}
+
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
-
-	return nil
+	if c.isCredible(region) {
+		// 判断是否需要更新
+		if c.isUpdate(region) {
+			// there are two things it should update: region tree and store status.
+			c.Lock()
+			// 1. region tree
+			c.core.PutRegion(region)
+			// 2. store status
+			// (such as leader count, region count, pending peer count… ).
+			for storeId := range region.GetStoreIds() {
+				c.updateStoreStatusLocked(storeId)
+			}
+			c.Unlock()
+		}
+		return nil
+	} else {
+		return errors.New("unCredible")
+	}
 }
 
 func (c *RaftCluster) updateStoreStatusLocked(id uint64) {

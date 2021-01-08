@@ -25,6 +25,18 @@ import (
 	"go.uber.org/zap"
 )
 
+type StoreInfoSlice []*StoreInfo
+
+func (a StoreInfoSlice) Len() int {    // 重写 Len() 方法
+	return len(a)
+}
+func (a StoreInfoSlice) Swap(i, j int){     // 重写 Swap() 方法
+	a[i], a[j] = a[j], a[i]
+}
+func (a StoreInfoSlice) Less(i, j int) bool {    // 重写 Less() 方法， 从大到小排序
+	return a[j].regionSize < a[i].regionSize
+}
+
 // StoreInfo contains information about a store.
 type StoreInfo struct {
 	meta  *metapb.Store
