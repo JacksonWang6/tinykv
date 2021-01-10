@@ -56,9 +56,16 @@ func (txn *MvccTxn) PutWrite(key []byte, ts uint64, write *Write) {
 // if an error occurs during lookup.
 func (txn *MvccTxn) GetLock(key []byte) (*Lock, error) {
 	// Your Code Here (4A).
+	// when i do 4B, it happens alot of bugs because of 4a lack of essential error check and lead to *nil err
 	get, err := txn.Reader.GetCF(engine_util.CfLock, key)
+	if err != nil || get == nil {
+		return nil, err
+	}
 	getLock, err := ParseLock(get)
-	return getLock, err
+	if err != nil {
+		return nil, err
+	}
+	return getLock, nil
 }
 
 // PutLock adds a key/lock to this transaction.
@@ -92,27 +99,48 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	// Your Code Here (4A).
 	itor := txn.Reader.IterCF(engine_util.CfWrite)
 	defer itor.Close()
+	// aho, 做4B的时候发现自己对于seek函数的理解有很大的问题哇:
+	// 定位到第一个大于等于这个 Key-Version 的位置, 如果不存在这个key-version, 那么会定位到比它大的最小的那个
+	// 经过询问大佬, 终于搞懂了这个seek函数了, key的格式是这样的 keyN1-versionN2 -> value
+	// 按照ukey升ts降，seek是按照整体排序seek的
+	// 	Key1-Version3 -> Value
+	//	Key1-Version2 -> Value
+	//	Key1-Version1 -> Value
+	//	……
+	//	Key2-Version4 -> Value
+	//	Key2-Version3 -> Value
+	//	Key2-Version2 -> Value
+	//	Key2-Version1 -> Value
+	//	……
+	//	KeyN-Version2 -> Value
+	//	KeyN-Version1 -> Value
+	//	……
+	// 具体来说就是如果key不存在, 那么就seek大的最小的那个, 如果key存在, 但是version不存在, 那么就seek到比version小的最大的那个
 	itor.Seek(EncodeKey(key, txn.StartTS))
-	if !itor.Valid() {
-		return nil, nil
-	}
-	k := itor.Item().Key()
-	if !bytes.Equal(key, DecodeUserKey(k)) {
-		return nil, nil
-	}
-	value, err := itor.Item().Value()
-	if err != nil {
-		return nil, err
-	}
-	if value != nil {
-		write, err := ParseWrite(value)
+	for itor.Valid() {
+		k := itor.Item().Key()
+		// maybe absent
+		if !bytes.Equal(key, DecodeUserKey(k)) {
+			return nil, nil
+		}
+		value, err := itor.Item().Value()
 		if err != nil {
 			return nil, err
 		}
-		if write.StartTS > txn.StartTS {
-			return nil, nil
+		if value != nil {
+			// cf write列族里面保存的是changes, 保存在一个write结构体里面, 所以我们解析值解析出来的是一个write结构体
+			write, err := ParseWrite(value)
+			if err != nil || write == nil {
+				return nil, err
+			}
+			if write.StartTS > txn.StartTS {
+				// 如果提交的时间比我们的st大, 那么我们不能采用这个值
+				itor.Next()
+				continue
+			}
+			// write里面存储了这个版本的key在cf_default里面的ts
+			return txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(key, write.StartTS))
 		}
-		return txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(key, write.StartTS))
 	}
 	return nil, nil
 }
