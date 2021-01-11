@@ -42,10 +42,14 @@ func (txn *MvccTxn) Writes() []storage.Modify {
 // PutWrite records a write at key and ts.
 func (txn *MvccTxn) PutWrite(key []byte, ts uint64, write *Write) {
 	// Your Code Here (4A).
+	var value []byte
+	if write != nil {
+		value = write.ToBytes()
+	}
 	put := storage.Modify{
 		Data: storage.Put{
 			Key:   EncodeKey(key, ts),
-			Value: write.ToBytes(),
+			Value: value,
 			Cf:    engine_util.CfWrite,
 		},
 	}
