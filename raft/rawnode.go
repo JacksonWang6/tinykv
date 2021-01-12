@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -183,7 +182,7 @@ func (rn *RawNode) Ready() Ready {
 		rn.prevSoftState = &curSoftState
 	}
 	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
-		log.Infof("[%d] ready 递交了 snapshot", rn.Raft.id)
+//		log.Infof("[%d] ready 递交了 snapshot", rn.Raft.id)
 		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 		// rn.Raft.RaftLog.pendingSnapshot = nil
 	}

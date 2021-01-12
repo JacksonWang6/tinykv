@@ -1,7 +1,6 @@
 package message
 
 import (
-	"github.com/pingcap-incubator/tinykv/log"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -16,7 +15,7 @@ type Callback struct {
 
 func (cb *Callback) Done(resp *raft_cmdpb.RaftCmdResponse) {
 	if cb == nil {
-		log.Infof("!!! cb is nil")
+//		log.Infof("!!! cb is nil")
 		return
 	}
 	if resp != nil {

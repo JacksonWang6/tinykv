@@ -160,11 +160,11 @@ func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 		select {
 		case s := <-ps.snapState.Receiver:
 			if s != nil {
-				log.Infof("%v 成功生成snapshot", ps.Tag)
+//				log.Infof("%v 成功生成snapshot", ps.Tag)
 				snapshot = *s
 			}
 		default:
-			log.Infof("%v snapshot正在生成中", ps.Tag)
+//			log.Infof("%v snapshot正在生成中", ps.Tag)
 			return snapshot, raft.ErrSnapshotTemporarilyUnavailable
 		}
 		ps.snapState.StateType = snap.SnapState_Relax
@@ -184,7 +184,7 @@ func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 		return snapshot, err
 	}
 
-	log.Infof("%s requesting snapshot", ps.Tag)
+//	log.Infof("%s requesting snapshot", ps.Tag)
 	ps.snapTriedCnt++
 	ch := make(chan *eraftpb.Snapshot, 1)
 	ps.snapState = snap.SnapState{
@@ -216,7 +216,7 @@ func (ps *PeerStorage) checkRange(low, high uint64) error {
 		return errors.Errorf("low %d is greater than high %d", low, high)
 	} else if low <= ps.truncatedIndex() {
 		// 如果最小的比已经截断的最大的index还要小,那么就返回ErrCompacted
-		log.Infof("ErrCompacted, low: %v, ps.truncatedIndex(): %v", low, ps.truncatedIndex())
+//		log.Infof("ErrCompacted, low: %v, ps.truncatedIndex(): %v", low, ps.truncatedIndex())
 		return raft.ErrCompacted
 	} else if high > ps.raftState.LastIndex+1 {
 		return errors.Errorf("entries' high %d is out of bound, lastIndex %d",
@@ -381,11 +381,11 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		// RaftLocalState
 		ps.raftState.LastIndex = snapshot.Metadata.Index
 		ps.raftState.LastTerm = snapshot.Metadata.Term
-		log.Infof("snapshot.Metadata.Index: %v", snapshot.Metadata.Index)
+//		log.Infof("snapshot.Metadata.Index: %v", snapshot.Metadata.Index)
 		// RaftApplyState
 		ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
 		ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
-		log.Infof("更新了 TruncatedState.Index: %d", ps.applyState.TruncatedState.Index)
+//		log.Infof("更新了 TruncatedState.Index: %d", ps.applyState.TruncatedState.Index)
 		ps.applyState.AppliedIndex = snapshot.Metadata.Index
 
 
@@ -403,7 +403,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		}
 		// wait until region worker finish
 		<-notify
-		log.Infof("regionSched finished")
+//		log.Infof("regionSched finished")
 
 		applySnapResult = ApplySnapResult{
 			PrevRegion: ps.region,
@@ -431,7 +431,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// delete any previously appended log entries which will never be committed.
 	// Also update the peer storage’s RaftLocalState and save it to raftdb.
 	if ready == nil {
-		log.Infof("%v ready == nil", ps.Tag)
+//		log.Infof("%v ready == nil", ps.Tag)
 		return nil, nil
 	}
 	raftWB := new(engine_util.WriteBatch)
@@ -442,7 +442,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// 若检测到有Snapshot则调用ApplySnapshot更新相关信息进行处理
 	// 需要先执行这个, 因为snapshot里面regionid可能更新了
 	if !raft.IsEmptySnap(&ready.Snapshot) {
-		log.Infof("为什么没有运行到这里?")
+//		log.Infof("为什么没有运行到这里?")
 		applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
 		if err != nil {
 			return applySnapResult, err

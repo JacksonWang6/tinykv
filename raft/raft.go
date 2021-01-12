@@ -234,12 +234,12 @@ func newRaft(c *Config) *Raft {
 }
 
 func (r *Raft) sendSnapShot(to uint64) {
-	log.Infof("[%d] 正在向 %d 发送snapshot", r.id, to)
+//	log.Infof("[%d] 正在向 %d 发送snapshot", r.id, to)
 	snapshot, err := r.RaftLog.storage.Snapshot()
 	if err != nil {
 		if err == ErrSnapshotTemporarilyUnavailable {
 			// snapshot正在生成,暂时不可用
-			log.Infof("[%d] snapshot ErrSnapshotTemporarilyUnavailable", r.id)
+//			log.Infof("[%d] snapshot ErrSnapshotTemporarilyUnavailable", r.id)
 			return
 		}
 		log.Infof("[%d] snapshot err", r.id)
@@ -256,7 +256,7 @@ func (r *Raft) sendSnapShot(to uint64) {
 		Snapshot:             &snapshot,
 		Term: 				  r.Term,
 	}
-	log.Infof("[%d] 成功向 %d 发出snapshot", r.id, to)
+//	log.Infof("[%d] 成功向 %d 发出snapshot", r.id, to)
 	r.msgs = append(r.msgs, msg)
 	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
@@ -279,7 +279,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		if err == ErrCompacted {
 			// 出现这种错误就是因为这个follower的日志太老了,它的下一个需要的字段在leader里面已经被compacted了
 			// 也就是说storage里面没有这个entry了,所以只能发snapshot给它了
-			log.Infof("[%d] 向 %d 发送了一个 snapshot", r.id, to)
+//			log.Infof("[%d] 向 %d 发送了一个 snapshot", r.id, to)
 			r.sendSnapShot(to)
 			return true
 		}
@@ -960,7 +960,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			index--
 		}
 		msg.Index = index
-		log.Infof("index %v, prevLogindex %v", index, prevLogIndex)
+//		log.Infof("index %v, prevLogindex %v", index, prevLogIndex)
 		r.msgs = append(r.msgs, msg)
 		return
 	}
@@ -1055,7 +1055,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	//  follower should call handleSnapshot to handle it, which namely just restore
 	//  the raft internal state like term, commit index and membership information, ect,
 	//  from the eraftpb.SnapshotMetadata in the message
-	log.Infof("[%d] [Term: %d] 正在处理来自 [%d] [Term: %d] 的snapshot", r.id, r.Term, m.From, m.Term)
+//	log.Infof("[%d] [Term: %d] 正在处理来自 [%d] [Term: %d] 的snapshot", r.id, r.Term, m.From, m.Term)
 	if m.Snapshot == nil {
 		log.Infof("!!! snapshot is nil")
 		return
@@ -1099,7 +1099,7 @@ func (r *Raft) restore(s pb.Snapshot) bool {
 	}
 	// 保存快照⽂件，丢弃具有较⼩索引的任何现有或部分快照
 	r.RaftLog.pendingSnapshot = &s
-	log.Infof("我这里确实保存了快照文件: %v", r.RaftLog.pendingSnapshot)
+//	log.Infof("我这里确实保存了快照文件: %v", r.RaftLog.pendingSnapshot)
 	// fix bug: 这里不如不丢弃的话, 由于这些日志是已经
 	// 否则的话丢弃整个⽇志
 	r.RaftLog.entries = nil
@@ -1146,7 +1146,7 @@ func (r *Raft) addNode(id uint64) {
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
-	log.Infof("[%d] remove %v", r.id, id)
+//	log.Infof("[%d] remove %v", r.id, id)
 	// Your Code Here (3A).
 	for index, peer := range r.peers {
 		if peer == id {

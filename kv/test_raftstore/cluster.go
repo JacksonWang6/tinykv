@@ -188,12 +188,12 @@ func (c *Cluster) Request(key []byte, reqs []*raft_cmdpb.Request, timeout time.D
 		resp, txn := c.CallCommandOnLeader(&req, timeout)
 		if resp == nil {
 			// it should be timeouted innerly
-			log.Infof("resp is nil")
+//			log.Infof("resp is nil")
 			SleepMS(100)
 			continue
 		}
 		if resp.Header.Error != nil {
-			log.Infof("resp.header.error")
+//			log.Infof("resp.header.error")
 			SleepMS(100)
 			continue
 		}
@@ -366,7 +366,7 @@ func (c *Cluster) MustDeleteCF(cf string, key []byte) {
 }
 
 func (c *Cluster) Scan(start, end []byte) [][]byte {
-	log.Infof("new scan and debug scan: start: %v, end: %v", start, end)
+//	log.Infof("new scan and debug scan: start: %v, end: %v", start, end)
 	req := NewSnapCmd()
 	values := make([][]byte, 0)
 	key := start
@@ -401,7 +401,7 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 		iter.Close()
 
 		key = region.EndKey
-		log.Infof("*** change key to endkey: %v, region.EndKey %v", hex.EncodeToString(key), hex.EncodeToString(region.EndKey))
+//		log.Infof("*** change key to endkey: %v, region.EndKey %v", hex.EncodeToString(key), hex.EncodeToString(region.EndKey))
 		if len(key) == 0 {
 			break
 		}
@@ -450,7 +450,7 @@ func (c *Cluster) MustRemovePeer(regionID uint64, peer *metapb.Peer) {
 
 func (c *Cluster) MustHavePeer(regionID uint64, peer *metapb.Peer) {
 	for i := 0; i < 500; i++ {
-		log.Infof("Iter %d", i)
+//		log.Infof("Iter %d", i)
 		region, _, err := c.schedulerClient.GetRegionByID(context.TODO(), regionID)
 		if err != nil {
 			panic(err)

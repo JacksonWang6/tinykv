@@ -115,7 +115,7 @@ func partitioner(t *testing.T, cluster *Cluster, ch chan bool, done *int32, unre
 			}
 		}
 		cluster.ClearFilters()
-		log.Infof("partition: %v, %v", pa[0], pa[1])
+//		log.Infof("partition: %v, %v", pa[0], pa[1])
 		cluster.AddFilter(&PartitionFilter{
 			s1: pa[0],
 			s2: pa[1],
@@ -220,14 +220,14 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 				if (rand.Int() % 1000) < 500 {
 					key := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
 					value := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-					log.Infof("%d: client new put %v,%v\n", cli, key, value)
+//					log.Infof("%d: client new put %v,%v\n", cli, key, value)
 					cluster.MustPut([]byte(key), []byte(value))
 					last = NextValue(last, value)
 					j++
 				} else {
 					start := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", 0)
 					end := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
-					log.Infof("%d: client new scan %v-%v\n", cli, start, end)
+//					log.Infof("%d: client new scan %v-%v\n", cli, start, end)
 					// BUG: 这里scan的时候出现了一个诡异的问题, 类似于下面这样:
 					// want:x 2 0 y
 					// got: x 2 0 yx 2 0 yx 2 0 y
@@ -244,10 +244,10 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 					if v != last {
 						log.Infof("%d: client scan %v-%v\n", cli, start, end)
 						log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
-					} else {
+					} /*else {
 						log.Infof("%d: client scan %v-%v\n", cli, start, end)
 						log.Infof("get correct value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
-					}
+					}*/
 				}
 			}
 		})
@@ -278,7 +278,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			time.Sleep(electionTimeout)
 		}
 
-		log.Infof("wait for clients\n")
+//		log.Infof("wait for clients\n")
 		<-ch_clients
 
 		if crash {
@@ -496,7 +496,7 @@ func TestOneSnapshot2C(t *testing.T) {
 			s2: []uint64{2, 3},
 		},
 	)
-	log.Infof("1与2,3通信隔离了")
+//	log.Infof("1与2,3通信隔离了")
 	// write some data to trigger snapshot
 	for i := 100; i < 115; i++ {
 		cluster.MustPutCF(cf, []byte(fmt.Sprintf("k%d", i)), []byte(fmt.Sprintf("v%d", i)))
@@ -504,7 +504,7 @@ func TestOneSnapshot2C(t *testing.T) {
 	cluster.MustDeleteCF(cf, []byte("k2"))
 	time.Sleep(500 * time.Millisecond)
 	MustGetCfNone(cluster.engines[1], cf, []byte("k100"))
-	log.Infof("1与2,3通信隔离解除了")
+//	log.Infof("1与2,3通信隔离解除了")
 	cluster.ClearFilters()
 
 	// Now snapshot must applied on
@@ -693,7 +693,7 @@ func TestOneSplit3B(t *testing.T) {
 	left := cluster.GetRegion([]byte("k1"))
 	right := cluster.GetRegion([]byte("k2"))
 
-	log.Infof("left %v right %v", left.GetId(), right.GetId())
+//	log.Infof("left %v right %v", left.GetId(), right.GetId())
 	assert.NotEqual(t, left.GetId(), right.GetId())
 	assert.True(t, bytes.Equal(region.GetStartKey(), left.GetStartKey()))
 	assert.True(t, bytes.Equal(left.GetEndKey(), right.GetStartKey()))
